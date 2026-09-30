@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Start the HyperQwen model router on :8020.
+#
+# The router runs as its own transient user unit. It must NOT be a plain
+# background child of the caller: the tray starts the per-card engine wrappers,
+# which call this script, so a plain child inherits the tray's systemd cgroup
+# and dies with every tray restart (observed 2026-09-30: a tray reload killed
+# :8020 while the x16 engine stayed up). A systemd-run unit is detached from
+# the caller's cgroup and survives it.
+set -euo pipefail
+
+UNIT="hyperqwen-router"
+ROUTER_PY="/home/chris/tools/hyperqwen/hyperqwen_router.py"
+LOGFILE="/home/chris/tools/hyperqwen/router.log"
+PIDFILE="/run/user/$(id -u)/hyperqwen-router.pid"
+
+if systemctl --user is-active --quiet "$UNIT"; then
+  pid=$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || true)
+  [[ -n "$pid" && "$pid" != "0" ]] && echo "$pid" > "$PIDFILE"
+  echo "Router already running (unit $UNIT, PID ${pid:-?})"
+  exit 0
+fi
+
+# A leftover failed unit of the same name would block a fresh start.
+systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+
+# --collect removes the transient unit once it exits, so the name is reusable.
+systemd-run --user --unit="$UNIT" --collect --quiet \
+  --property=Type=simple \
+  --property=StandardOutput=append:"$LOGFILE" \
+  --property=StandardError=append:"$LOGFILE" \
+  --property=WorkingDirectory=/home/chris/tools/hyperqwen \
+  --property=Restart=no \
+  /usr/bin/python3 "$ROUTER_PY"
+
+for _ in $(seq 1 40); do
+  if systemctl --user is-active --quiet "$UNIT"; then
+    pid=$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || true)
+    [[ -n "$pid" && "$pid" != "0" ]] && echo "$pid" > "$PIDFILE"
+    echo "✔ HyperQwen router started on :8020 (unit $UNIT, PID ${pid:-?})"
+    exit 0
+  fi
+  sleep 0.25
+done
+
+# Fall back to the pre-systemd behaviour so a broken user manager cannot leave
+# the tier unroutable.
+echo "systemd-run start failed; falling back to a detached background process" >&2
+setsid /usr/bin/python3 "$ROUTER_PY" >"$LOGFILE" 2>&1 </dev/null &
+echo $! > "$PIDFILE"
+echo "✔ HyperQwen router started on :8020 (detached, PID $(cat "$PIDFILE"))"

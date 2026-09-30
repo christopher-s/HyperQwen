@@ -1,0 +1,5 @@
+services:
+  batch:
+    env_file:
+      - path: .env.gpu2
+        required: true

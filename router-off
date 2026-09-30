@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Stop the HyperQwen model router on :8020.
+#
+# The router is a transient user unit (see router-on), so stop it through
+# systemd; the pidfile and pkill below remain as belt-and-braces for a router
+# started by an older copy of router-on or by the detached fallback path.
+set -euo pipefail
+
+UNIT="hyperqwen-router"
+PIDFILE="/run/user/$(id -u)/hyperqwen-router.pid"
+
+if systemctl --user is-active --quiet "$UNIT"; then
+  systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+  # --collect should reap it; reset-failed clears any residue either way.
+  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+  echo "✔ HyperQwen router stopped (unit $UNIT)"
+fi
+
+if [[ -f "$PIDFILE" ]]; then
+  PID=$(cat "$PIDFILE")
+  kill "$PID" 2>/dev/null || true
+  rm -f "$PIDFILE"
+  echo "✔ HyperQwen router pidfile cleared (PID $PID)"
+fi
+
+# Belt-and-braces for a detach started by the fallback path or an older copy.
+pkill -f "python3 .*hyperqwen_router.py" >/dev/null 2>&1 || true
+exit 0

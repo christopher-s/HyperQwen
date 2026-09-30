@@ -10,6 +10,9 @@ venv/
 drafter/data/
 drafter/runs/
 .env
+# local operational artifacts
+router.log
+router-*.bak-*
 # local reproduction artifacts (symlinks here, so no trailing slash)
 venv
 models
