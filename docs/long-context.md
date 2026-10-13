@@ -196,6 +196,74 @@ the int8 kernel's padded-stride penalty (its head dim is 260 B, so odd KV heads 
 of it). Prefill is the larger cost and this kernel cannot help there — a prefill chunk is 2048
 query tokens, far above the block sizes it is for.
 
+## int8 KV on the pth-flash-attn kernel (`PTH_FA=1`, `SPEC=mtp CTX=long`)
+
+`SPEC=mtp CTX=long` runs fp8 KV on FlashInfer, the one fp8 backend sm86 has (gotcha 40), and the
+flashinfer-free escape from #34 is `int8_per_token_head` on `TRITON_ATTN`, which decays past 25k.
+`PTH_FA=1` keeps the int8 cache and reads it with [pth-flash-attn](../pthfa/README.md) instead: a CUDA
+kernel that consumes the int8 bytes and their inline scales directly, registered through vLLM's plugin
+slot as the backend `CUSTOM`. It is built into the image (`pthfa/install.sh`, SASS for sm80/86/89) and
+selected only by this knob; no vLLM file changes, so `patches/` is the same with or without it.
+
+```bash
+SPEC=mtp CTX=long PTH_FA=1 bash single-user/start_qwen.sh
+```
+
+What that resolves to, the settings that matter (the full argv: `PRINT_ARGV=1`):
+
+```
+--attention-backend CUSTOM --kv-cache-dtype int8_per_token_head
+--speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","attention_backend":"CUSTOM"}'
+```
+
+The `"attention_backend":"CUSTOM"` inside the speculative config is the setting that is easy to drop: a
+drafter takes its backend from there, not from `--attention-backend`. `PTH_FA=1` writes both, so the MTP
+layer reads the same cache with the same kernel. Decode and verify batches are captured FULL (the backend
+declares uniform-batch graphs) with vLLM's default mode; nothing else in the argv changes
+(`bench/test_pthfa_knob.sh` checks it). `VLLM_SPEC_DECODE_ATTN` is not read on this route: on vLLM 0.31.0
+only `FLASH_ATTN` reads it. Refused at startup: any other `SPEC`/`CTX`, `--attention-backend`,
+`--kv-cache-dtype` or `--speculative-config` in `EXTRA_ARGS`, a KV offload tier (untested on this
+backend), a venv without the package. Limits are gotcha 63.
+
+**Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090.**
+Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P (`NCCL_P2P_DISABLE=1`,
+`--disable-custom-all-reduce`), checkpoint Swift-1.5 Qwen3.8-27B MTP W4A16 AutoRound (a Qwen3.8-27B
+fine-tune, same architecture), `SPEC=mtp` k=3, `PREFIX_CACHE=1 VISION=1 MAX_SEQS=2`, `MAX_LEN=262144`,
+`GPU_UTIL=0.94`, `--max-num-batched-tokens 8192 --long-prefill-token-threshold 1024`. That is this
+knob's argv with `EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce --max-num-batched-tokens 8192 --long-prefill-token-threshold 1024"`.
+**vLLM 0.30.0** (HyperQwen 3acb93f plus the plugin, image `hyperqwen-local:3acb93f-pth-c47adf3`), with the
+backend passed through `EXTRA_ARGS`; the vendored kernel is SASS-identical to that image's, function by
+function on sm80/86/89. Old arm: the same HyperQwen image and cache on `TRITON_ATTN`, back to back in one
+power state. "stock" is 320 W unlocked. Distinct 8k / 32k / 128k prompts (no prefix hits), 256 tokens out,
+greedy, medians with n in parentheses:
+
+| stock, 2x RTX 3080 20 GB, TP=2, vLLM 0.30.0 | `TRITON_ATTN` (int8) | `CUSTOM` (int8, `PTH_FA=1`) | ratio |
+|---|---|---|---|
+| TTFT 8,217 / 31,977 tokens, warm | 6.03 s (7) / 31.74 s (5) | 5.55 s (7) / 23.99 s (5) | 0.92 / 0.76 |
+| TTFT 128,016 tokens, cold / warm | 252.9 s (1) / 250.2 s (2) | 129.3 s (1) / 129.2 s (2) | 0.51 / 0.52 |
+| 1 stream decode at 8k / 32k / 128k | 96.9 / 78.5 / 45.8 tok/s (5/3/3) | 101.4 / 98.3 / 85.0 tok/s | 1.05 / 1.25 / 1.86 |
+| ms per forward pass, same | 29.7 / 35.3 / 59.4 | 27.9 / 28.2 / 31.3 | 0.94 / 0.80 / 0.53 |
+| 2 streams, per stream, same | 74.6 / 61.5 / 33.0 tok/s | 80.3 / 79.2 / 59.0 tok/s | 1.08 / 1.29 / 1.79 |
+| MTP tokens per step (GSM8K window) | 3.642 | 3.631 | 0.997 |
+| GSM8K, n=200, greedy | 0.965 | 0.960 | |
+| KV pool at `MAX_LEN=262144` | 445,722 tokens | 474,503 tokens | 1.065 |
+
+The 8k decode ratio's 95% interval is 0.99-1.13: no difference at short context, as expected for a
+kernel whose win is reading less memory per token. In the capped state (220 W, 1905 MHz lock), the new arm
+on the same box read 133.2 s for the 128k TTFT, 90.5 tok/s and 31.7 ms per pass at 128k, against the
+capped Triton baseline's 265.2 s, 47.8 tok/s and 61.1 ms; those two were measured two days apart, not
+back to back. Also on this box, new arm only: a 3 h soak with mixed families up to 198,733-token prompts
+and needles at 32k/128k/250k (517 of 517 checks), a sync-check boot, and teacher-forced logprobs at 32k
+and 128k that sit no further from a bf16-KV reference than the Triton arm's (mean |delta| 0.0219 against
+0.0220 nats at 32k).
+
+**Not measured yet, so not claimed:** any of this on vLLM 0.31.0 (this branch's pin), the A/B with this
+branch's image against the image without it at the same boot (placeholder:
+`<loc2 A/B, 0.31.0, rows as above: pending>`), and any card but the RTX 3080. A 3090 should behave
+like the 3080 here (same sm86, more bandwidth) [inference, not measured]; sm80 and sm89 have cubins and no
+datapoint. The GPU checks are `bench/test_pthfa_attn.py` (kernel against an fp64 reference, a pool
+past block id 2,383, CUDA-graph replay) and the README's field-test protocol with `PTH_FA=1`.
+
 ## DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`
 
 ```bash
