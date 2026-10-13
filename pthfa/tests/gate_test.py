@@ -32,6 +32,30 @@ def check(cond, what):
         FAILS.append(what)
 
 
+def load_backend_priorities():
+    """Return vllm.platforms.cuda._get_backend_priorities, also on a machine without a GPU driver.
+
+    vllm/platforms/cuda.py imports vllm._C_stable_libtorch at module level to register vLLM's CUDA ops, and
+    that extension links libcuda.so.1, which a GPU-less builder (CI, docker build) does not have. The priority
+    lists are plain Python and use none of those ops, so when (and only when) that import fails for want of
+    the driver, a placeholder module stands in for the extension inside this test process. Nothing is written
+    to disk and no stub library is involved; with a driver present the real module is used.
+    """
+    try:
+        from vllm.platforms.cuda import _get_backend_priorities
+        print("  INFO  vllm.platforms.cuda imported with its CUDA extension")
+        return _get_backend_priorities
+    except ImportError as e:
+        if "libcuda" not in str(e):
+            raise
+        import types
+
+        sys.modules["vllm._C_stable_libtorch"] = types.ModuleType("vllm._C_stable_libtorch")
+        from vllm.platforms.cuda import _get_backend_priorities
+        print(f"  INFO  no GPU driver ({e}); vllm.platforms.cuda imported with a placeholder for its CUDA extension")
+        return _get_backend_priorities
+
+
 def main():
     import torch
 
@@ -52,6 +76,9 @@ def main():
     eps = [e for e in metadata.entry_points(group="vllm.general_plugins") if e.name == "pth_flash_attn"]
     check(len(eps) == 1 and eps[0].value == "pth_flash_attn.plugin:register",
           f"one vllm.general_plugins entry point -> {[e.value for e in eps]}")
+    if not eps:
+        print("pthfa gate test: FAILED (no entry point, nothing else can be checked)")
+        return 1
     register = eps[0].load()
     custom.clear_override()
     register_backend(custom, "some.other.plugin.Backend")
@@ -60,11 +87,15 @@ def main():
     custom.clear_override()
     register()
     register()
-    check(custom.get_path() == ours, f"the entry point registers CUSTOM -> {ours} (twice: idempotent)")
+    registered = custom.is_overridden() and custom.get_path() == ours
+    check(registered, f"the entry point registers CUSTOM -> {ours} (twice: idempotent)")
+    if not registered:
+        print(f"pthfa gate test: FAILED ({len(FAILS)}; the entry point did not register the backend)")
+        return 1
     backend = custom.get_class()
     check(backend.get_name() == "CUSTOM", "the backend class imports and is named CUSTOM")
 
-    from vllm.platforms.cuda import _get_backend_priorities
+    _get_backend_priorities = load_backend_priorities()
     from vllm.platforms.interface import DeviceCapability
 
     caps = [DeviceCapability(7, 5), DeviceCapability(8, 0), DeviceCapability(8, 6), DeviceCapability(8, 9),
