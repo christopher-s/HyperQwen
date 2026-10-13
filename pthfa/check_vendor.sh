@@ -39,7 +39,10 @@ if [ -n "$SRC" ]; then
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   mkdir "$T/tree" "$T/vendor"
   git -C "$SRC" archive "$PTH_COMMIT" | tar -x -C "$T/tree"
-  python3 "$T/tree/tools/export_upstream.py" --out "$T/vendor" >/dev/null
+  [ -f "$T/tree/tools/export_upstream.py" ] \
+    || { echo "FAILED: $PTH_COMMIT has no tools/export_upstream.py, so it is not a commit this copy can come from" >&2; exit 1; }
+  python3 "$T/tree/tools/export_upstream.py" --out "$T/vendor" >/dev/null \
+    || { echo "FAILED: tools/export_upstream.py at $PTH_COMMIT did not run" >&2; exit 1; }
   mkdir -p "$T/vendor/tools"
   for f in setup.py pyproject.toml tools/build_flags.py LICENSE NOTICE; do cp "$T/tree/$f" "$T/vendor/$f"; done
   diff -r -x README.md -x PIN -x SHA256SUMS -x check_vendor.sh -x install.sh -x tests -x build \
