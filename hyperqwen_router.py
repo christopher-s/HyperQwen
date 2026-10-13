@@ -16,6 +16,7 @@ import sys
 
 PORT_GPU0 = int(os.environ.get("PORT_GPU0", 18020))
 PORT_GPU2 = int(os.environ.get("PORT_GPU2", 18021))
+PORT_GPU2_ALT = int(os.environ.get("PORT_GPU2_ALT", 18022))
 LISTEN_PORT = int(os.environ.get("PORT_ROUTER", 8020))
 LISTEN_HOST = os.environ.get("HOST_ROUTER", "0.0.0.0")
 
@@ -31,13 +32,13 @@ MODELS_RESPONSE = json.dumps({
     "data": [
         {"id": "qwen-3.8-27b", "object": "model", "owned_by": "hyperqwen-gpu0-x4", "max_model_len": 180000, "permission": []},
         {"id": "qwen-3.8-27b-fast", "object": "model", "owned_by": "hyperqwen-gpu2-x16", "max_model_len": 180000, "permission": []},
-        {"id": "qwen3.8-27b", "object": "model", "owned_by": "hyperqwen-gpu0-x4", "max_model_len": 180000, "permission": []},
-        {"id": "qwen3.8-27b-fast", "object": "model", "owned_by": "hyperqwen-gpu2-x16", "max_model_len": 180000, "permission": []},
+        {"id": "qwen-3.8-27b-fast-alt", "object": "model", "owned_by": "hyperqwen-gpu2-x16-llamacpp", "max_model_len": 204800, "permission": []},
     ]
 }).encode("utf-8")
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    backend_reader = None
     backend_writer = None
     try:
         req_line = await reader.readline()
@@ -92,13 +93,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 j = json.loads(body.decode("utf-8"))
                 req_model = j.get("model", "")
                 model_name = req_model
-                if "fast" in req_model:
+                if "fast-alt" in req_model:
+                    target_port = PORT_GPU2_ALT
+                    j["model"] = "qwen-3.8-27b-fast-alt"
+                elif "fast" in req_model:
                     target_port = PORT_GPU2
+                    j["model"] = "qwen3.8-27b"
                 else:
                     target_port = PORT_GPU0
-                
-                # Normalize backend model to qwen3.8-27b so vLLM engine recognizes it
-                j["model"] = "qwen3.8-27b"
+                if j.get("repetition_penalty") is None:
+                    j["repetition_penalty"] = 1.08
+                if "max_tokens" not in j and "max_completion_tokens" not in j:
+                    j["max_tokens"] = 8192
+                if "reasoning_effort" not in j:
+                    j["reasoning_effort"] = "medium"
                 body = json.dumps(j).encode("utf-8")
             except Exception as e:
                 logger.warning("Error parsing JSON body: %s", e)
@@ -110,13 +118,29 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 timeout=10.0,
             )
         except Exception as e:
-            logger.error("Failed to connect to backend on port %d: %s", target_port, e)
-            err_msg = json.dumps({"error": f"Backend on port {target_port} unavailable: {e}"}).encode("utf-8")
-            resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {len(err_msg)}\r\nConnection: close\r\n\r\n".encode("utf-8") + err_msg
-            writer.write(resp)
-            await writer.drain()
-            writer.close()
-            return
+            fallback_port = None
+            if target_port == PORT_GPU2:
+                fallback_port = PORT_GPU2_ALT
+            elif target_port == PORT_GPU2_ALT:
+                fallback_port = PORT_GPU2
+            if fallback_port is not None:
+                try:
+                    logger.info("Target port %d unavailable, attempting fallback port %d", target_port, fallback_port)
+                    backend_reader, backend_writer = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", fallback_port),
+                        timeout=5.0,
+                    )
+                    target_port = fallback_port
+                except Exception:
+                    backend_writer = None
+            if backend_writer is None or backend_reader is None:
+                logger.error("Failed to connect to backend on port %d: %s", target_port, e)
+                err_msg = json.dumps({"error": f"Backend on port {target_port} unavailable: {e}"}).encode("utf-8")
+                resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {len(err_msg)}\r\nConnection: close\r\n\r\n".encode("utf-8") + err_msg
+                writer.write(resp)
+                await writer.drain()
+                writer.close()
+                return
 
         # Send request line & headers to backend
         backend_writer.write(f"{method} {path} HTTP/1.1\r\n".encode("utf-8"))
