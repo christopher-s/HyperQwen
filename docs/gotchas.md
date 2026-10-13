@@ -1498,5 +1498,17 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and dropping it
     puts the MTP layer on another backend. There are no tuning knobs: the library reads no
     environment variables, and its launch shape comes from a planner that is a pure function of the
-    batch descriptor. The numbers so far are from one box, two RTX 3080 20 GB at TP=2 on vLLM 0.30.0;
-    on 0.31.0 and on any other card they are still owed (`docs/long-context.md` says which).
+    batch descriptor. The numbers so far are from one box, two RTX 3080 20 GB at TP=2, on vLLM 0.30.0
+    and 0.31.0; on any other card they are still owed (`docs/long-context.md` says which).
+64. **On vLLM 0.31.0 at `GPU_UTIL=0.94`, `prompt_logprobs=10` on a 32k prompt kills the engine with a
+    CUDA OOM, whatever the attention backend.** The V2 runner computes prompt logprobs in chunks of
+    1024 tokens and all-gathers each chunk's logits over the full vocabulary
+    (`v1/worker/gpu/sample/prompt_logprob.py`): 486 MiB wanted with 208 MiB free, `torch.OutOfMemoryError`,
+    HTTP 500, engine dead. Seen on two RTX 3080 20 GB at TP=2 with the `SPEC=mtp CTX=long` production
+    shape (`PREFIX_CACHE=1 VISION=1 MAX_SEQS=2 MAX_LEN=262144`), on `PTH_FA=1`, on `TRITON_ATTN` int8 and
+    on a FlashAttention bf16-KV reference alike, on fresh boots, so it is the engine plus the 0.94 sizing,
+    not this branch or a kernel; the same requests ran on 0.30.0 at the same setting. `GPU_UTIL=0.90`
+    served them on all three, with every KV pool still above 128k tokens. Known class upstream: vllm
+    #5424 and #5907 (prompt_logprobs memory spike; leave headroom). Ordinary generation is not affected;
+    a client that asks for prompt logprobs (perplexity scoring, `bench/quality_battery.py`'s PPL half)
+    needs the headroom.
