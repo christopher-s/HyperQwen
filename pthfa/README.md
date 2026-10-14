@@ -1,7 +1,6 @@
 # pthfa: paged int8 per-token-head attention as a vLLM backend plugin
 
-`pthfa/` is the source of [pth-flash-attn](https://github.com/noon-at-cgn/pth-flash-attn) (Apache-2.0) at one
-pinned commit: a CUDA op library that reads vLLM's `int8_per_token_head` KV cache directly (no dequantize
+`pthfa/` is the source of pth-flash-attn (Apache-2.0) at one pinned commit (`pthfa/PIN`, a commit id): a CUDA op library that reads vLLM's `int8_per_token_head` KV cache directly (no dequantize
 pass) on sm_80/86/89, and a `vllm.general_plugins` entry point that registers it as the backend `CUSTOM`.
 `PTH_FA=1` (single-user, `SPEC=mtp CTX=long`) selects it for the target and the MTP drafter; nothing else
 does. It is a separate extension, not a patch to vLLM, which is why it lives here and not in `patches/`:
