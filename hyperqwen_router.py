@@ -121,6 +121,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if isinstance(j.get("chat_template_kwargs"), dict):
                     if "reasoning_effort" in j["chat_template_kwargs"]:
                         j["chat_template_kwargs"]["reasoning_effort"] = "medium"
+                if isinstance(j.get("reasoning"), dict):
+                    if "effort" in j["reasoning"]:
+                        j["reasoning"]["effort"] = "medium"
+                if isinstance(j.get("params"), dict) and isinstance(j["params"].get("reasoning"), dict):
+                    if "effort" in j["params"]["reasoning"]:
+                        j["params"]["reasoning"]["effort"] = "medium"
                 # Qwen chat template requires the system message first. Hermes injects
                 # mid-conversation system messages (out-of-band steering, tool preambles);
                 # hoist every system message to the front preserving their relative order.
