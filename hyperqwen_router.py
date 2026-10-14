@@ -125,10 +125,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 # mid-conversation system messages (out-of-band steering, tool preambles);
                 # hoist every system message to the front preserving their relative order.
                 msgs = j.get("messages")
-                if isinstance(msgs, list) and any(m.get("role") == "system" for m in msgs):
-                    systems = [m for m in msgs if m.get("role") == "system"]
-                    others = [m for m in msgs if m.get("role") != "system"]
-                    j["messages"] = systems + others
+                if isinstance(msgs, list):
+                    if any(m.get("role") == "system" for m in msgs):
+                        systems = [m for m in msgs if m.get("role") == "system"]
+                        others = [m for m in msgs if m.get("role") != "system"]
+                        # Template allows exactly ONE system message at index 0; merge all
+                        # system messages (Bifrost appends its own) into a single block.
+                        merged = {"role": "system", "content": "\n\n".join(
+                            m.get("content") or "" for m in systems if isinstance(m.get("content"), str)
+                        )}
+                        j["messages"] = [merged] + others
+                    logger.info("req roles: %s", [m.get("role") for m in j["messages"]])
                 body = json.dumps(j).encode("utf-8")
             except Exception as e:
                 logger.warning("Error parsing JSON body: %s", e)
