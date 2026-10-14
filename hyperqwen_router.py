@@ -15,6 +15,7 @@ import signal
 import sys
 
 PORT_GPU0 = int(os.environ.get("PORT_GPU0", 18020))
+PORT_GPU0_ALT = int(os.environ.get("PORT_GPU0_ALT", 18024))
 PORT_GPU2 = int(os.environ.get("PORT_GPU2", 18021))
 PORT_GPU2_ALT = int(os.environ.get("PORT_GPU2_ALT", 18022))
 LISTEN_PORT = int(os.environ.get("PORT_ROUTER", 8020))
@@ -97,7 +98,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 model_name = req_model
                 if "gpu2" in req_model or "fast-alt" in req_model:
                     target_port = PORT_GPU2_ALT
-                    j["model"] = "qwen-3.8-27b-fast-alt"
+                    j["model"] = "qwen-gpu2"
+                elif "gpu0" in req_model:
+                    target_port = PORT_GPU0_ALT
+                    j["model"] = "qwen-gpu0"
                 elif "fast" in req_model:
                     target_port = PORT_GPU2
                     j["model"] = "qwen3.8-27b"
@@ -129,6 +133,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 fallback_port = PORT_GPU2_ALT
             elif target_port == PORT_GPU2_ALT:
                 fallback_port = PORT_GPU2
+            elif target_port == PORT_GPU0:
+                fallback_port = PORT_GPU0_ALT
+            elif target_port == PORT_GPU0_ALT:
+                fallback_port = PORT_GPU0
             if fallback_port is not None:
                 try:
                     logger.info("Target port %d unavailable, attempting fallback port %d", target_port, fallback_port)
