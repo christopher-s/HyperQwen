@@ -33,9 +33,6 @@ MODELS_RESPONSE = json.dumps({
     "data": [
         {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 200000, "permission": []},
         {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 200000, "permission": []},
-        {"id": "qwen-dual", "object": "model", "owned_by": "black-monolith-dual-3090", "max_model_len": 262144, "permission": []},
-        {"id": "qwen-3.8-27b", "object": "model", "owned_by": "hyperqwen-gpu0-x4", "max_model_len": 200000, "permission": []},
-        {"id": "qwen-3.8-27b-fast", "object": "model", "owned_by": "hyperqwen-gpu2-x16", "max_model_len": 200000, "permission": []},
     ]
 }).encode("utf-8")
 
