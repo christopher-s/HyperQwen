@@ -31,11 +31,11 @@ logger = logging.getLogger("router")
 MODELS_RESPONSE = json.dumps({
     "object": "list",
     "data": [
-        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 196608, "permission": []},
-        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 196608, "permission": []},
+        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 200000, "permission": []},
+        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 200000, "permission": []},
         {"id": "qwen-dual", "object": "model", "owned_by": "black-monolith-dual-3090", "max_model_len": 262144, "permission": []},
-        {"id": "qwen-3.8-27b", "object": "model", "owned_by": "hyperqwen-gpu0-x4", "max_model_len": 180000, "permission": []},
-        {"id": "qwen-3.8-27b-fast", "object": "model", "owned_by": "hyperqwen-gpu2-x16", "max_model_len": 180000, "permission": []},
+        {"id": "qwen-3.8-27b", "object": "model", "owned_by": "hyperqwen-gpu0-x4", "max_model_len": 200000, "permission": []},
+        {"id": "qwen-3.8-27b-fast", "object": "model", "owned_by": "hyperqwen-gpu2-x16", "max_model_len": 200000, "permission": []},
     ]
 }).encode("utf-8")
 
@@ -98,10 +98,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 model_name = req_model
                 if "gpu2" in req_model or "fast-alt" in req_model:
                     target_port = PORT_GPU2_ALT
-                    j["model"] = "qwen-gpu2"
+                    j["model"] = "qwen3.8-27b"
                 elif "gpu0" in req_model:
                     target_port = PORT_GPU0_ALT
-                    j["model"] = "qwen-gpu0"
+                    j["model"] = "qwen3.8-27b"
                 elif "fast" in req_model:
                     target_port = PORT_GPU2
                     j["model"] = "qwen3.8-27b"
