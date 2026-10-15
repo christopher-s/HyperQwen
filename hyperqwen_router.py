@@ -31,8 +31,8 @@ logger = logging.getLogger("router")
 MODELS_RESPONSE = json.dumps({
     "object": "list",
     "data": [
-        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 200000, "permission": []},
-        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 200000, "permission": []},
+        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 262144, "permission": []},
+        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 262144, "permission": []},
     ]
 }).encode("utf-8")
 
