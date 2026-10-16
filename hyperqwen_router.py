@@ -37,6 +37,19 @@ MODELS_RESPONSE = json.dumps({
 }).encode("utf-8")
 
 
+def target_for_model(req_model: str) -> int:
+    """Map public model aliases to the two maintained SuperQwen engines."""
+    model = req_model.lower()
+    if "gpu2" in model or "fast" in model:
+        return PORT_GPU2
+    return PORT_GPU0
+
+
+def fallback_for_target(_target_port: int) -> None:
+    """The consolidated deployment has no alternate backends to fall through to."""
+    return None
+
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     backend_reader = None
     backend_writer = None
@@ -93,21 +106,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 j = json.loads(body.decode("utf-8"))
                 req_model = j.get("model", "")
                 model_name = req_model
-                if "gpu2" in req_model or "fast-alt" in req_model:
-                    target_port = PORT_GPU2_ALT
-                    j["model"] = "qwen3.8-27b"
-                elif "gpu0" in req_model:
-                    target_port = PORT_GPU0_ALT
-                    j["model"] = "qwen3.8-27b"
-                elif "fast" in req_model:
-                    target_port = PORT_GPU2
-                    j["model"] = "qwen3.8-27b"
-                elif "dual" in req_model:
-                    target_port = PORT_GPU0
-                    j["model"] = "qwen3.8-27b"
-                else:
-                    target_port = PORT_GPU0
-                    j["model"] = "qwen3.8-27b"
+                target_port = target_for_model(req_model)
+                j["model"] = "qwen3.8-27b"
                 if j.get("repetition_penalty") is None:
                     j["repetition_penalty"] = 1.08
                 if "max_tokens" not in j and "max_completion_tokens" not in j:
@@ -153,15 +153,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 timeout=10.0,
             )
         except Exception as e:
-            fallback_port = None
-            if target_port == PORT_GPU2:
-                fallback_port = PORT_GPU2_ALT
-            elif target_port == PORT_GPU2_ALT:
-                fallback_port = PORT_GPU2
-            elif target_port == PORT_GPU0:
-                fallback_port = PORT_GPU0_ALT
-            elif target_port == PORT_GPU0_ALT:
-                fallback_port = PORT_GPU0
+            fallback_port = fallback_for_target(target_port)
             if fallback_port is not None:
                 try:
                     logger.info("Target port %d unavailable, attempting fallback port %d", target_port, fallback_port)
