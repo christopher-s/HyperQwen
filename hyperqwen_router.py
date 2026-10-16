@@ -31,8 +31,8 @@ logger = logging.getLogger("router")
 MODELS_RESPONSE = json.dumps({
     "object": "list",
     "data": [
-        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 200000, "permission": []},
-        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 200000, "permission": []},
+        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 240000, "permission": []},
+        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 240000, "permission": []},
     ]
 }).encode("utf-8")
 
@@ -112,18 +112,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     j["repetition_penalty"] = 1.08
                 if "max_tokens" not in j and "max_completion_tokens" not in j:
                     j["max_tokens"] = 8192
-                # Lock reasoning effort to medium: Qwen template strictly requires xhigh/medium/low,
-                # rejecting generic "high" or "max", and medium prevents runaway deliberation loops.
-                j["reasoning_effort"] = "medium"
+                # Default reasoning effort to xhigh: the template's xhigh branch carries the
+                # anti-repetition instruction ("do not repeat, restart, paraphrase the same
+                # thought") that the medium branch lacks; xhigh also bounds routine questions
+                # to 512 thinking tokens. Valid values remain xhigh/medium/low — the template
+                # raises on anything else.
+                j["reasoning_effort"] = "xhigh"
                 if isinstance(j.get("chat_template_kwargs"), dict):
                     if "reasoning_effort" in j["chat_template_kwargs"]:
-                        j["chat_template_kwargs"]["reasoning_effort"] = "medium"
+                        j["chat_template_kwargs"]["reasoning_effort"] = "xhigh"
                 if isinstance(j.get("reasoning"), dict):
                     if "effort" in j["reasoning"]:
-                        j["reasoning"]["effort"] = "medium"
+                        j["reasoning"]["effort"] = "xhigh"
                 if isinstance(j.get("params"), dict) and isinstance(j["params"].get("reasoning"), dict):
                     if "effort" in j["params"]["reasoning"]:
-                        j["params"]["reasoning"]["effort"] = "medium"
+                        j["params"]["reasoning"]["effort"] = "xhigh"
                 # Qwen chat template requires the system message first. Hermes injects
                 # mid-conversation system messages (out-of-band steering, tool preambles);
                 # hoist every system message to the front preserving their relative order.
