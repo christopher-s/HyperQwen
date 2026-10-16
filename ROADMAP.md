@@ -43,7 +43,11 @@ max_tokens cap 8192.
 
 ## Conventions
 
-- `main` tracks `origin/main` (this fork). Working code lands on
-  `black-monolith/router`; upstream sync via `upstream` remote.
+- `black-monolith` is THE deployment branch: all custom work (router, launchers,
+  configs) plus merged upstream PRs. This is the checked-out branch that builds
+  the serving image and backs the local AI tray's Qwen tier.
+- `main` tracks `origin/main` (this fork's copy of upstream). Upstream sync via
+  the `upstream` remote lands on `main` first, then merges into `black-monolith`.
+- Upstream PRs (like #326) are merged into `black-monolith` after validation.
 - Never commit bench data (`bench-quality-data/`, `quantize.log`) or any
   credential material. Tuning-only `.env` files are allowed.
