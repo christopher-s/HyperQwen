@@ -18,3 +18,7 @@ venv
 models
 api_key.txt
 bench/results/
+
+bench-quality-data/
+bench-results/
+quantize.log
