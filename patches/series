@@ -66,3 +66,4 @@ vllm-pr40371-prompt-progress.patch
 vllm-pr61050-lru-running-prefix.patch
 kv-cache-seat-budget.patch
 gdn-ba-pad-small-m.patch
+quant-scale-view-preserve-pages.patch
