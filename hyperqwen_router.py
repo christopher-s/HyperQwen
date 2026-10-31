@@ -40,9 +40,15 @@ EFFORT_MAP = {
     "max": "xhigh",
 }
 # Injected default for requests that set neither max_tokens nor
-# max_completion_tokens. Blast-radius guard (ROADMAP item 15 / incident
-# d309a671); callers who set an explicit cap are unaffected.
+# max_completion_tokens (chat) nor max_output_tokens (Responses). Blast-radius
+# guard (ROADMAP item 15 / incident d309a671); callers who set an explicit cap
+# are unaffected up to the ceiling.
 MAX_TOKENS_DEFAULT = int(os.environ.get("QWEN_ROUTER_MAX_TOKENS", 16384))
+# Hard ceiling for explicit Responses max_output_tokens values. Chat keeps no
+# ceiling (legacy behavior, matches Bifrost's 32K advertised max_output_tokens);
+# Responses traffic clamps here because its no-default fallback is the whole
+# remaining window.
+MAX_TOKENS_CEILING = int(os.environ.get("QWEN_ROUTER_MAX_TOKENS_CEILING", 32768))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +130,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         # Target selection based on model name
         target_port = PORT_GPU0
         model_name = "qwen-3.8-27b"
+        is_responses_api = path.startswith("/v1/responses")
         if body:
             try:
                 j = json.loads(body.decode("utf-8"))
@@ -133,7 +140,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 j["model"] = "qwen3.8-27b"
                 if j.get("repetition_penalty") is None:
                     j["repetition_penalty"] = 1.08
-                if "max_tokens" not in j and "max_completion_tokens" not in j:
+                if is_responses_api:
+                    # Responses API: the field is max_output_tokens. The
+                    # get_max_tokens fallback when it is absent is
+                    # max_model_len - input_length (up to ~200K), which is the
+                    # d309a671 runaway shape; apply the same blast-radius
+                    # default as chat, and a ceiling on explicit values above
+                    # it. Callers who need more than the ceiling must raise
+                    # QWEN_ROUTER_MAX_TOKENS.
+                    if j.get("max_output_tokens") is None:
+                        j["max_output_tokens"] = MAX_TOKENS_DEFAULT
+                    elif j["max_output_tokens"] > MAX_TOKENS_CEILING:
+                        logger.warning("responses max_output_tokens %d > ceiling %d; clamping",
+                                       j["max_output_tokens"], MAX_TOKENS_CEILING)
+                        j["max_output_tokens"] = MAX_TOKENS_CEILING
+                elif "max_tokens" not in j and "max_completion_tokens" not in j:
                     j["max_tokens"] = MAX_TOKENS_DEFAULT
                 if EFFORT_POLICY == "v1":
                     # Passthrough with validation + nearest-level mapping.
