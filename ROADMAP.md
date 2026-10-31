@@ -12,6 +12,38 @@ effort policy (caller effort mapped to nearest level, absent -> medium,
 QWEN_ROUTER_EFFORT_POLICY=legacy rollback) with QWEN_ROUTER_MAX_TOKENS=16384
 injected default, repetition_penalty 1.08. black-monolith @ 0bee80a, pushed.
 
+## Session close (2026-10-31 evening): quant/backend evaluation concluded
+
+Chris is running Qwen as-is and will evaluate in daily use. Findings that
+closed the open optimization questions, all measured or source-verified:
+
+- FlashInfer + fp8 KV (vLLM #60532): tested TWICE on GPU2, declined on
+  methodology-correct evidence (item 19). CUSTOM + PTH_FA int8 stays.
+- Quant ranking for sm86 (researched against vLLM docs + 2026 guides +
+  measured local tables): our stack is rank 1 on BOTH tables —
+  W4A16 int4-g128 weights (Marlin; NVFP4/FP8/MXFP4 are the same weight-only
+  class on Ampere, no gain) and int8-per-token-head KV read by PTH_FA
+  (1.41x FA2-fp8 at 128K). W4A8 already deployed where it wins (prefill via
+  INT8_ACT). Remaining headroom on this card is speculative acceptance and
+  upstream kernel work, neither quant-shaped.
+- Experimental KV tiers for "small perf cost, big pool, accuracy-neutral":
+  KVarN k4v2 (+0.16% ppl, 2x pool, ~1.06x short / 2.13x deep decode) and
+  int4_per_token_head (+0.3% ppl, 355k pool, Triton tax) are the two live
+  options; both already available (CTX=huge, KV=int4pth). Chris declines
+  denser-than-int8 KV for now (reasoning quality and predictability first);
+  revisit only if a capacity wall is hit. TurboQuant 4bit_nc disqualified
+  for our profile (chunked-prefill OOM past 32k prompts on 24 GB).
+- gpu-unlock (Zagitta) verified ACTIVE on all three GPUs (boot log):
+  doubles fp16/bf16 tensor rate; no effect on our int4/int8 decode paths
+  (by design), benefits prefill/vision/bf16 arms — already banked.
+- KV capacity levers if ever needed: GPU_UTIL 0.94 (0.95+ unstable),
+  slab-off (+136 MiB), EMBED_UVA off, CTX=huge / KV=int4pth tiers.
+
+Fleet state at close: both lanes serving, router healthy, GPU2 restored to
+production after the A/Bs and verified (Application startup complete,
+CUSTOM backend in engine argv). GPU0 was never touched during testing
+(Elijah's session).
+
 ## Testing policy (Chris, 2026-10-31)
 
 Chris tests Qwen himself during normal use and escalates issues here; long
