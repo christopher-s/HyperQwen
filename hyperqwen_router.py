@@ -140,6 +140,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 j["model"] = "qwen3.8-27b"
                 if j.get("repetition_penalty") is None:
                     j["repetition_penalty"] = 1.08
+                # Engine-native loop defense (vLLM 0.32 SamplingParams ->
+                # RepetitionDetectionParams): end generation early when an
+                # N-gram repeats. Defaults for requests that set none; a
+                # caller-supplied repetition_detection is preserved.
+                if not j.get("repetition_detection"):
+                    j["repetition_detection"] = {
+                        "max_pattern_size": 32,
+                        "min_pattern_size": 1,
+                        "min_count": 8,
+                    }
                 if is_responses_api:
                     # Responses API: the field is max_output_tokens. The
                     # get_max_tokens fallback when it is absent is

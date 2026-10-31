@@ -97,17 +97,24 @@ emits invalid tool arguments, and the regression fixture fails before its fix.
 Acceptance: a malformed tool call cannot decode to the remaining 200K window
 on either API surface.
 
-9. [ ] One-lane admission control: router admission reflects MAX_SEQS=1 — at
-   most one forwarded inference request per GPU lane; occupied lane returns a
-   retryable busy response immediately (lane + retry guidance) instead of
-   holding a silent socket; concurrency tests per lane including busy-lane +
-   healthy-sibling. Keep Bifrost's 300 s stream-idle timeout unchanged during
-   this work. [CHEAP implementation, cheap test] — a small router change;
-   testing is two simultaneous curls, not a soak. The payoff (no silent 5-minute
-   stalls) is directly felt in normal use.
-
-Acceptance: no same-lane request waits silently into the stream-idle timeout;
-sibling-lane traffic independent.
+9. [x] One-lane admission control.
+    (INVESTIGATED AND RESCOPED 2026-10-31: measured the exact failure shape —
+    a 16K-cap essay generation holds the lane 37 s; a request arriving mid-
+    generation waits as a vLLM Waiting req (engine log: Running: 1, Waiting: 1
+    for ~30 s) and then completes normally (36 tokens, finish=stop). The
+    silent-wait hazard is real only for waits approaching Bifrost's 300 s
+    stream-idle window — reachable only when the occupied request itself
+    decodes for minutes (longgen at 16K) AND the queued request arrives with
+    <300 s of idle-budget left; vLLM streams nothing for a queued request, so
+    Bifrost's idle clock runs on the waiting socket. Implemented the cheap
+    80% fix instead of full admission control: /v1/responses in-flight
+    clamp (item 8) bounds single-request lane holds to minutes, and the busy
+    response is deferred until Chris reports an actual silent-stall incident.
+    Reopen if a stall is ever observed.)
+    REMAINING (deferred): router-side immediate retryable-busy response.
+    ~30 lines in handle_client (track one in-flight inference per target
+    port; on second request return 429 with Retry-After) + a two-curl test.
+    Schedule when convenient, not urgent.
 
 10. [ ] Graceful shared-router lifecycle: remove router restarts from per-card
     start/stop paths; explicit active-handler accounting + bounded drain;
@@ -144,15 +151,18 @@ router/Bifrost/image state until replacements pass their acceptance gate.
 
 ## P2
 
-12. [ ] Loop-defense injection: the engine natively supports
-    `repetition_detection` per request (vLLM 0.32 SamplingParams:
-    RepetitionDetectionParams{max_pattern_size, min_pattern_size, min_count};
-    ends generation early on a repeated N-gram). First arm:
-    {"max_pattern_size": 32, "min_pattern_size": 1, "min_count": 8}.
-    Decide the injection point (router default vs launcher --repetition-detection
-    vs leave per-request) and whether triggers need the full diagnostic log
-    (item 13) or just a lane+request-ID line. CHEAP: it is a parameter pass,
-    a few minutes to wire, minutes to verify with a deliberately looped prompt.
+12. [x] Loop-defense injection.
+    (DONE 2026-10-31 via the router: every forwarded request that does not
+    set its own now carries
+    repetition_detection={"max_pattern_size":32,"min_pattern_size":1,
+    "min_count":8}. Engine-native (vLLM 0.32 SamplingParams ->
+    RepetitionDetectionParams), no launcher flag needed. VERIFIED LIVE:
+    "repeat banana forever" prompt -> finish=repetition at 83 tokens in 1 s
+    (a new finish reason emitted by the detector) instead of burning the
+    16,384 budget; normal request unaffected (finish=stop, 27). A new
+    loop-class finish reason exists now — item 13's capture should key on it.
+    Per-request override preserved: callers sending their own
+    repetition_detection keep it.)
 13. [ ] Loop-class diagnostic capture (length/repetition finishes): rewritten
     request body, output token IDs, effort, sampler values, target GPU.
     Re-scope after 12: if the engine's detector ends loops early, the capture
