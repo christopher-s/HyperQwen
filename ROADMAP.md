@@ -28,11 +28,17 @@ by normal use, [SOAK] = the only class that justifies long unattended runs.
    genuine soak: interactive use cannot reach 204K tokens casually, and
    gotcha-4's failure band is time/pressure dependent. Everything else about
    0.94+slab already passed interactive gates on 2026-10-31.
-2. [ ] At the next vLLM pin bump, re-evaluate every `Retires-when:` line in
-    patches/ (grep "Retires-when", diff each against the actual version). The
-    trigger event ("next pin bump") fired with the 2026-10-31 0.32 adoption;
-    56 patch files carry the marker. [CHEAP] — mechanical grep + diff review;
-    retire-and-rebuild only where the premise no longer holds.
+2. [x] At the next vLLM pin bump, re-evaluate every `Retires-when:` line in
+    patches/. (DONE 2026-10-31: swept all 56 markers. The 0.32 port commit
+    a342b1c re-exported the whole 53-file series against 0.32.0, which
+    retired what was retireable at merge time (e.g. serve-404-served-names,
+    dropped). Spot-verified the remaining live classes: api-root-health's
+    "Retires-when: upstream PR" — no upstream equivalent exists yet and the
+    patch demonstrably still works (engine GET / = 200, /api/status =
+    {"status":"ok"}); auth-deny-default same class; quant-scale-view's
+    premise (vllm #64141) is NOT in 0.32 so the patch remains load-bearing;
+    the "stays while the knob exists" class is self-describing. Conclusion:
+    nothing to retire now; next sweep at the 0.33+ bump.)
 3. [ ] PR #326 MTP A/B: the fix is integrated (merge a2769dc, in both serving
    images) but the standing A/B battery (MTP vs SPEC=off, 18 synthetic
    requests x 4, raw token IDs, finish reasons) never ran against it.
