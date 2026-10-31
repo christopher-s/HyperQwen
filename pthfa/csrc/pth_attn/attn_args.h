@@ -7,7 +7,7 @@
 // (python/pth_testing/ref_capi.py) pass the very structs the op fills.
 //
 // Conventions:
-// - Every stride is in BYTES, taken from the tensor view (binding rule 5),
+// - Every stride is in BYTES, taken from the tensor view,
 //   except block_table_row_stride, which is in int32 ELEMENTS (as
 //   block_table.stride(0)).
 // - Pointers are device pointers (host pointers for the reference library's
@@ -17,16 +17,23 @@
 //   ctypes mirror fails loudly); a change of a struct bumps
 //   PTH_ATTN_ABI_VERSION.
 //
-// Semantics of an attention launch (plan §3.4-§3.7, ADR 0005):
-// - Causal, bottom-right aligned GQA attention over the int8_per_token_head
-//   cache: query token i of request r (q_len = qsl[r+1] - qsl[r], L =
-//   seq_lens[r], both read on the device) sees KV positions
-//   j <= L - q_len + i. Query head h reads KV head h / G, G = num_q_heads /
-//   num_kv_heads.
+// Semantics of an attention launch:
+// - Bottom-right aligned GQA attention over the int8_per_token_head cache:
+//   query token i of request r (q_len = qsl[r+1] - qsl[r], L = seq_lens[r],
+//   both read on the device) sits at KV position p = L - q_len + i. Causal
+//   with window 0 (the default kernels) it sees KV positions j <= p. Query
+//   head h reads KV head h / G, G = num_q_heads / num_kv_heads.
+// - Sliding window and non-causal (`window`, `causal` below): it
+//   sees [lo, hi] with lo = window > 0 ? max(0, p - window + 1) : 0 and
+//   hi = causal ? p : (window > 0 ? min(L - 1, p + window - 1) : L - 1)
+//   (vLLM's Triton window_size = (window - 1, 0)). window > 0 or !causal
+//   selects the windowed kernels, which exist for head_size 128 only.
 // - Grid = (num_q_tiles, num_kv_heads, num_splits), the planner's grid: q-tile
 //   x holds up to `bq` query tokens of one request (cache_geometry row_tile);
-//   its KV range [0, range_end) is cut into 64-token tiles and split s takes
-//   tiles [floor(s*T/S), floor((s+1)*T/S)) (planner.split_tile_range).
+//   its KV range [range_begin, range_end) (range_begin = 0 for the causal
+//   kernels) is cut into 64-token tiles from the tile holding range_begin,
+//   and split s takes tiles [floor(s*T/S), floor((s+1)*T/S)) of those T
+//   (planner.split_tile_range).
 // - num_splits == 1: writes out[token, head, :] for every query token of
 //   every request (out_dtype).
 // - num_splits > 1: writes, for every query token, head and split s,
@@ -37,7 +44,7 @@
 // - Rows that belong to no request (tokens >= qsl[num_reqs]) are never
 //   written, in out or in the workspace.
 //
-// Semantics of the combine (plan §3.7, ADR 0016):
+// Semantics of the combine:
 //   M = max_s lse_s over splits with lse_s > -inf (fixed order s = 0..S-1);
 //   w_s = exp2(lse_s - M), skipping -inf splits BEFORE touching ws_o;
 //   out = (sum_s w_s * o_s) / (sum_s w_s), summed in order s = 0..S-1.
@@ -52,7 +59,7 @@
 extern "C" {
 #endif
 
-#define PTH_ATTN_ABI_VERSION 1
+#define PTH_ATTN_ABI_VERSION 2
 
 // Element types of q and out.
 typedef enum PthAttnDtype {
@@ -128,6 +135,12 @@ typedef struct PthAttnArgs {
   int64_t ws_lse_stride_split;  // bytes
   int64_t ws_lse_stride_token;  // bytes
   int64_t ws_lse_stride_head;   // bytes
+
+  // Visible range. window: 0 = none, else the sliding window in
+  // tokens (>= 1). causal: 1 = bottom-right causal, 0 = non-causal. The
+  // default (window 0, causal 1) is the causal attention above.
+  int32_t window;
+  int32_t causal;
 } PthAttnArgs;
 
 typedef struct PthAttnCombineArgs {

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 noon-at-cgn
-"""Host-side launch planner for ``pth_flash_attn_fwd`` (plan §3.2, §3.7, §4.2).
+"""Host-side launch planner for ``pth_flash_attn_fwd``.
 
 This module is the single source of truth for every launch-geometry decision:
 warps along M (``wm``), query tokens per CTA (``bq``), the grid's q-tile upper
@@ -21,7 +21,7 @@ and every argument must be a real ``int``/``bool`` (a 0-d tensor would pass
 The SM count and the CTAs per SM are inputs or compile-time mirrors, never
 device queries, so this file runs on a CPU-only CI box.
 
-Derivations (ADR 0016, ADR 0017; constants in docs/constants.d/T5.md):
+Derivations:
 A CTA has 4 warps x 16 MMA rows = 64 query rows. With GQA packing a row is one
 (query token, query head of the group), so a CTA holds at most
 ``b_max = 64 // G`` query tokens of one request.
@@ -35,9 +35,10 @@ Decode-like launch (every request has q <= the reorder threshold)::
     S  = ceil(C_target / (Hkv * rt))  splits so ONE request fills the GPU
 
 ``wm`` is the fewest warps that hold q_max in rt tiles; the kernel then fills
-each tile with as many tokens as its 16*wm rows allow. Balancing the tiles
-instead (bq = ceil(q_max / rt): 8+8) is a Proposed experiment (ADR 0013): it
-needs a bq argument in the op schema and a measured G2 row.
+each tile with as many tokens as its 16*wm rows allow. The op balances the tiles
+itself for a decode-like launch: it takes the smaller of this bq and
+``max_query_len`` as the tile height, so the plan carries
+no bq argument.
 
 Prefill launch::
 
@@ -51,7 +52,20 @@ Both::
     q_tiles_upper = T // bq + num_reqs  (>= sum_i ceil(q_i / bq); each CTA
                                          binary-searches query_start_loc)
 
-Workspace in token-splits (ADR 0017)::
+Sliding window W > 0::
+
+    S = min(S, ceil((W + q_max - 2) / 64) + 1)
+
+A row tile of at most q_max tokens sees at most n = W + q_max - 1 keys,
+causal or not (its queries lie within the last q_max positions of the
+request). n consecutive keys touch at most ceil((n - 1) / 64) + 1 KV tiles
+(n - 1 key steps after the first key, at the worst alignment), so the cap is
+the most tiles one row tile can have: at the cap no split is empty at the
+worst alignment, and every split it removes would have been empty
+(lse = -inf, an extra combine input). W is a layer constant, not a length, so
+the plan stays a pure function of the descriptor.
+
+Workspace in token-splits::
 
     S_alone = ceil(C_target / Hkv)
     W_ts    = min(max_num_seqs, S_alone) * q_dec_max * S_alone
@@ -62,21 +76,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Compile-time mirrors of the kernel's traits (rows in docs/constants.d/T5.md).
+# Compile-time mirrors of the kernel's traits.
 
 # Query rows per MMA slice: the M of mma.sync.m16n8k16. One warp owns 16 rows.
 MMA_ROWS_PER_WARP = 16
-# Warp layouts along M that the kernel instantiates (WM x WN = 4, plan §3.2).
+# Warp layouts along M that the kernel instantiates (WM x WN = 4).
 WM_CHOICES = (1, 2, 4)
 # Rows per CTA = 16 * max(WM) = 64; this is also the GQA packing limit G <= 64.
 MAX_ROWS_PER_CTA = MMA_ROWS_PER_WARP * WM_CHOICES[-1]
-# CTAs resident on one SM, by head size (plan §3.3, V2 register/smem probe):
+# CTAs resident on one SM, by head size (register/smem probe):
 # D=256 needs 99,328 B smem (1/SM); D=128 needs 50,176 B smem and 198 registers
 # (2/SM); D=64 needs 167 registers x 128 threads x 3 = 64,128 <= 65,536 (3/SM).
-# A GPU session checks these against the occupancy API (plan §3.7), not here.
+# The GPU tests check these against the occupancy API, not here.
 CTAS_PER_SM = {64: 3, 128: 2, 256: 1}
 SUPPORTED_HEAD_SIZES = tuple(sorted(CTAS_PER_SM))
-# O partials and the per-row log2-LSE are fp32 (C25, ADR 0016).
+# Head size with a windowed (sliding-window / non-causal) kernel variant; the
+# op refuses window > 0 or causal = False at any other D.
+WINDOWED_HEAD_SIZES = (128,)
+# KV tokens per tile: kLoadTileTokens in csrc/pth_attn/tile_traits.cuh.
+KV_TILE_TOKENS = 64
+# O partials and the per-row log2-LSE are fp32.
 PARTIAL_BYTES_PER_ELEMENT = 4
 
 # The only parameters plan_launch may ever accept (a test enforces this).
@@ -90,6 +109,7 @@ DESCRIPTOR_FIELDS = (
     "num_sms",
     "is_prefill",
     "ws_token_splits",
+    "window",
 )
 
 
@@ -119,7 +139,7 @@ def _require_head_size(D: object) -> int:
 def _require_group_size(G: object) -> int:
     g = _require_int("G", G, 1)
     if g > MAX_ROWS_PER_CTA:
-        # One query-head group must fit one 64-row tile (C26).
+        # One query-head group must fit one 64-row tile.
         raise ValueError(f"G must be <= {MAX_ROWS_PER_CTA}, got {g}")
     return g
 
@@ -133,7 +153,7 @@ def c_target(*, D: int, num_sms: int) -> int:
 def max_tokens_per_tile(G: int) -> int:
     """Return b_max = 64 // G, the query tokens of one request per row tile.
 
-    It is also the base of the reorder (decode) threshold, plan §4.3:
+    It is also the base of the reorder (decode) threshold:
     ``_init_reorder_batch_threshold(max_tokens_per_tile(G), ...)``.
     """
     return MAX_ROWS_PER_CTA // _require_group_size(G)
@@ -152,7 +172,7 @@ def split_tile_range(*, split: int, num_splits: int, num_tiles: int) -> tuple[in
     """Return the KV-tile range [start, end) that split ``split`` processes.
 
     The kernel computes the same partition on the device from the device-side
-    sequence length (plan §3.7): ``[floor(s*T/S), floor((s+1)*T/S))``. Any two
+    sequence length: ``[floor(s*T/S), floor((s+1)*T/S))``. Any two
     splits differ by at most one tile, the ranges are disjoint and cover all
     tiles, and when T < S some splits are empty (they write lse = -inf and the
     combine skips them). This mirror exists so the property is tested on CPU.
@@ -169,8 +189,8 @@ def split_tile_range(*, split: int, num_splits: int, num_tiles: int) -> tuple[in
 class LaunchPlan:
     """Everything one ``pth_flash_attn_fwd`` launch needs from the host.
 
-    The first four fields are the frozen plan §4.2 interface. The remaining
-    fields record the descriptor the plan was made for, so the grid and the
+    The first four fields are the frozen interface to the op (docs/api.md). The
+    remaining fields record the descriptor the plan was made for, so the grid and the
     workspace view shapes are derived here and nowhere else.
     """
 
@@ -199,7 +219,8 @@ class LaunchPlan:
         """Return (q-tile upper bound, KV heads, splits); x varies fastest.
 
         x fastest keeps the row tiles of one (head, split) co-resident, so they
-        can share K/V through L2 (plan §3.2, [INFERENCE], measured in G2).
+        can share K/V through L2 (an assumption of the design, not measured
+        separately).
         """
         return (self.q_tiles_upper, self.Hkv, self.num_splits)
 
@@ -232,6 +253,7 @@ def plan_launch(
     num_sms: int,
     is_prefill: bool,
     ws_token_splits: int,
+    window: int = 0,
 ) -> LaunchPlan:
     """Plan one launch from the padded batch descriptor of its slice.
 
@@ -250,6 +272,9 @@ def plan_launch(
         num_sms: SM count of the device (an input; never queried here).
         is_prefill: True for the prefill launch, False for the decode-like one.
         ws_token_splits: W_ts reserved at load (``workspace_token_splits``).
+        window: the layer's sliding window W in tokens, 0 for none (the op's
+            ``window``). A layer constant, not a length: W > 0 caps S at the
+            KV tiles one row tile can see (module docstring).
 
     Returns:
         The frozen LaunchPlan for this launch.
@@ -262,6 +287,7 @@ def plan_launch(
     d = _require_head_size(D)
     sms = _require_int("num_sms", num_sms, 1)
     w_ts = _require_int("ws_token_splits", ws_token_splits, 0)
+    w = _require_int("window", window, 0)
     if not isinstance(is_prefill, bool):
         raise TypeError(f"is_prefill must be a bool, got {type(is_prefill).__name__}")
     if q_max > t:
@@ -294,6 +320,10 @@ def plan_launch(
     s_want = _ceil_div(c_target(D=d, num_sms=sms), hkv * tiles_for_split)
     s_cap = w_ts // t  # S * T must fit the workspace reserved at load
     num_splits = max(1, min(s_want, s_cap))
+    if w > 0:
+        # The most KV tiles one row tile can touch at any alignment: its
+        # W + q_max - 1 keys span ceil((W + q_max - 2) / 64) + 1 tiles at worst.
+        num_splits = min(num_splits, _ceil_div(w + q_max - 2, KV_TILE_TOKENS) + 1)
 
     return LaunchPlan(
         wm=wm,
@@ -317,7 +347,7 @@ def s_alone(*, Hkv: int, D: int, num_sms: int) -> int:
 def workspace_token_splits(
     *, max_num_seqs: int, q_dec_max: int, Hkv: int, D: int, num_sms: int
 ) -> int:
-    """Return W_ts = min(max_num_seqs, S_alone) * q_dec_max * S_alone (ADR 0017).
+    """Return W_ts = min(max_num_seqs, S_alone) * q_dec_max * S_alone.
 
     Sized so that up to S_alone concurrent decode requests of up to
     ``q_dec_max`` tokens can each take the full S_alone splits. Beyond S_alone

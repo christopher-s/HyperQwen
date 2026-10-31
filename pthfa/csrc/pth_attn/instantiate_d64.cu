@@ -3,7 +3,9 @@
 //
 // Instantiations of the attention kernel for head size D = 64: WM in
 // {1, 2, 4} x q dtype in {bf16, fp16}, each with its shipped SUB
-// (tile_traits.cuh Traits). One translation unit per D (attn_kernel.cuh).
+// (tile_traits.cuh Traits). No windowed kernel at D = 64 (the launcher
+// refuses window > 0 or non-causal there). One translation unit per D
+// (attn_kernel.cuh).
 
 #include "attn_kernel.cuh"
 

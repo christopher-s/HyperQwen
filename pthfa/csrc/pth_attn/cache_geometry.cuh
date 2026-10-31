@@ -9,24 +9,23 @@
 //   1. Paging.  KV token `pos` of request `req` lives in block
 //      block_table[req][pos / BS] at slot pos % BS. The division is a
 //      FastDivmod (multiply-high and shift) because BS is a run-time value
-//      that need not be a power of two (production BS = 816, plan §3.6).
+//      that need not be a power of two (for example BS = 816).
 //   2. Bytes.   The byte address of K, V, k_scale, v_scale for (page, slot,
 //      KV head) is base + page*s_block + slot*s_token + head*s_head, in int64,
 //      with every stride read from the tensor view the op receives and never
-//      derived from a shape (binding rule 5; vLLM #49716). One StreamGeometry
+//      derived from a shape (vLLM #49716). One StreamGeometry
 //      per stream, so NHD, HND, padded pages, the inline [K|ks|V|vs] cell and
 //      #56164's decoupled layout are all the same code.
 //   3. Copy width. Per stream, the widest cp.async size w in {16, 8, 4} that
 //      divides the base address, every byte stride that is ever multiplied by
-//      a non-zero index, and the row bytes (plan §3.4 step 1).
+//      a non-zero index, and the row bytes.
 //   4. Which rows and tokens a CTA owns. Row tile -> request and query tokens
-//      (BQ packing), row -> (query token, query head) (token-major, ADR 0013),
-//      the bottom-right causal limit of every row, the CTA's KV range, the
-//      tile-balanced split partition (equal to planner.split_tile_range), and
-//      which KV tiles need a mask at all.
+//      (BQ packing), row -> (query token, query head) (token-major),
+//      the bottom-right causal limit of every row (or, for the windowed
+//      kernels, its visible window [lo, hi]), the CTA's KV range,
+//      the tile-balanced split partition (equal to planner.split_tile_range),
+//      and which KV tiles need a mask at all.
 //
-// Decisions and evidence: ADR 0015 (address math), ADR 0013 (GQA packing and
-// BQ). Teaching text: docs/walkthrough/04-gqa-packing.md and chapter 01 §5.
 // Tests: tests/cpp/test_geometry.cpp (g++, exhaustive/property tests, stride
 // fuzz with negative controls; also compiled by nvcc for sm_80/86/89) and
 // tests/cpu/test_geometry_vs_reference.py (the same functions, loaded through
@@ -38,8 +37,8 @@
 
 #include <cstdint>
 
-// One definition shared verbatim by every csrc/pth_attn header (agreed with
-// T3/T1): host+device and force-inlined under nvcc; plain `inline` under g++ so
+// One definition shared verbatim by every csrc/pth_attn header: host+device
+// and force-inlined under nvcc; plain `inline` under g++ so
 // non-template functions can sit in a header included by several TUs (ODR).
 #ifndef PTH_HD
   #if defined(__CUDACC__)
@@ -52,15 +51,14 @@
 namespace pth_attn {
 
 // ------------------------------------------------------------------ constants
-// Rows of one m16n8k16 MMA slice; a warp owns 16 query rows (T1
-// OP_ROWS_PER_WARP), so a CTA with `wm` warps along M holds 16*wm rows.
+// Rows of one m16n8k16 MMA slice; a warp owns 16 query rows, so a CTA with
+// `wm` warps along M holds 16*wm rows.
 constexpr int32_t kGeomRowsPerWarp = 16;
-// cp.async copy sizes, widest first (PTX ISA cp.async: 4, 8 or 16 bytes; T3
-// CP_ASYNC_SIZES).
+// cp.async copy sizes, widest first (PTX ISA cp.async: 4, 8 or 16 bytes).
 constexpr int32_t kGeomWidth16 = 16;
 constexpr int32_t kGeomWidth8 = 8;
 constexpr int32_t kGeomWidth4 = 4;
-// FastDivmod domain (ADR 0015): exact for every numerator n < 2^31 and every
+// FastDivmod domain: exact for every numerator n < 2^31 and every
 // divisor 1 <= d <= 2^31. Positions are int32 sequence positions (< 2^31), so
 // the domain covers every possible input; the proof is at FastDivmod.
 constexpr uint32_t kFastDivmodLog2Domain = 31;
@@ -86,7 +84,7 @@ PTH_HD uint32_t umulhi32(uint32_t a, uint32_t b) {
 // Division by a run-time divisor d as one multiply-high and one shift.
 //
 // Construction (Granlund & Montgomery 1994; the CUTLASS FastDivmod idea, no
-// code copied, ADR 0002): l = ceil(log2 d), p = 31 + l,
+// code copied): l = ceil(log2 d), p = 31 + l,
 // m = ceil(2^p / d), shift = p - 32, and n / d = umulhi(n, m) >> shift.
 //
 // Proof of exactness for 0 <= n < 2^31, 2 <= d <= 2^31 (d = 1 is a separate,
@@ -177,7 +175,7 @@ struct StreamGeometry {
 // index is always 0, so its stride never reaches an address (torch may give
 // such a dimension any stride); counting it would reject valid views. Returns
 // 0 when even 4 does not divide (the op rejects such a stream; launch.cu's
-// 4-byte check, T1 OP_CACHE_STREAM_ALIGN_BYTES).
+// 4-byte check).
 //
 // Why all of them: copy k of a row goes to base + offsets + k*w, and the
 // offsets range over every combination of indices, so w must divide each
@@ -215,9 +213,9 @@ PTH_HD StreamGeometry make_stream(const void* data, const int64_t* sizes3,
 }
 
 // ------------------------------------------------------------- kernel params
-// Everything one launch reads, frozen as the plan §9 interface. Pointers are
-// untyped bytes plus byte strides, so this header needs no CUDA or torch
-// types; the kernel casts at the point of use.
+// Everything one launch reads, frozen as the kernel library's interface.
+// Pointers are untyped bytes plus byte strides, so this header needs no CUDA or
+// torch types; the kernel casts at the point of use.
 struct KernelParams {
   // Queries and outputs: [T, Hq, D] with byte strides (last dim contiguous).
   const void* q;
@@ -253,7 +251,7 @@ struct KernelParams {
   int32_t max_query_len;
   float softmax_scale;
   // fp32(fp32(softmax_scale) * fp32(log2 e)); the kernel multiplies it by the
-  // row's exact 2^e prescale (error-budget K3).
+  // row's exact 2^e prescale.
   float score_scale_log2;
 };
 
@@ -287,7 +285,7 @@ PTH_HD int64_t ws_lse_offset(const KernelParams& p, int32_t split,
 }
 
 // --------------------------------------------------------- GQA row packing
-// Query tokens of one request per row tile: floor(16*wm / G) (ADR 0013). The
+// Query tokens of one request per row tile: floor(16*wm / G). The
 // op receives wm (planner output) but not the planner's bq, so the kernel
 // uses this capacity; it is >= the planner's bq, so the planner's grid
 // (T // bq + num_reqs row tiles) still covers every tile.
@@ -296,7 +294,7 @@ PTH_HD int32_t bq_capacity(int32_t wm, int32_t group_size) {
 }
 
 // Row r of a row tile is (query token r / G, head-in-group r % G):
-// token-major packing (ADR 0013). Returns false for padding rows (rows past
+// token-major packing. Returns false for padding rows (rows past
 // num_tok * G); their causal limit is -1 and they are never stored.
 PTH_HD bool row_to_token_head(uint32_t row, const FastDivmod& group,
                               int32_t num_tok, int32_t& tok,
@@ -369,7 +367,7 @@ PTH_HD bool row_tile(const int32_t* query_start_loc, const int32_t* seq_lens,
 }
 
 // ----------------------------------------------------------- causal geometry
-// Bottom-right alignment (plan §3.5): query token i of a request with q_len
+// Bottom-right alignment: query token i of a request with q_len
 // query tokens and seq_len KV tokens (new ones included) sees KV positions
 // j <= seq_len - q_len + i. Precondition: seq_len >= q_len (vLLM appends the
 // query tokens to the cache before attention).
@@ -396,7 +394,7 @@ PTH_HD int32_t num_kv_tiles(int32_t range_end, int32_t tile_tokens) {
 
 // Tiles [begin, end) of split `split` out of `num_splits` over `num_tiles`
 // tiles: [floor(s*T/S), floor((s+1)*T/S)), identical to
-// planner.split_tile_range (plan §3.7, ADR 0016). Any two splits differ by at
+// planner.split_tile_range. Any two splits differ by at
 // most one tile; empty splits (T < S) get begin == end. Products in int64.
 PTH_HD void split_tile_range(int32_t split, int32_t num_splits,
                              int32_t num_tiles, int32_t& begin, int32_t& end) {
@@ -413,6 +411,91 @@ PTH_HD void split_tile_range(int32_t split, int32_t num_splits,
 PTH_HD bool tile_needs_mask(int32_t tile, int32_t tile_tokens,
                             int32_t min_limit) {
   return static_cast<int64_t>(tile) * tile_tokens + tile_tokens - 1 > min_limit;
+}
+
+// --------------------------------------------------------- window geometry
+// The windowed kernels (sliding window and/or non-causal; the
+// kWindow instantiations of attn_kernel.cuh) give row token `tok`, at
+// absolute position p = kv_limit(q_len, seq_len, tok), the inclusive visible
+// range [lo, hi]:
+//   lo = window > 0 ? max(0, p - window + 1) : 0
+//   hi = causal ? p : (window > 0 ? min(seq_len - 1, p + window - 1)
+//                                 : seq_len - 1)
+// window = 0 means no window. Causal with window 0 is the causal geometry
+// above (lo = 0, hi = kv_limit). This is vLLM's Triton mask with
+// window_size = (window - 1, 0): non-causal k < seq_len and |p - k| < window,
+// causal 0 <= p - k < window. Both bounds are non-decreasing in tok, so a row
+// tile's extremes come from its first and last token. No intermediate value
+// overflows int32 (each comparison is a difference of in-range positions).
+PTH_HD int32_t kv_window_lo(int32_t q_len, int32_t seq_len, int32_t tok,
+                            int32_t window) {
+  const int32_t p = kv_limit(q_len, seq_len, tok);
+  return window > 0 && p >= window ? p - window + 1 : 0;
+}
+
+PTH_HD int32_t kv_window_hi(int32_t q_len, int32_t seq_len, int32_t tok,
+                            int32_t window, bool causal) {
+  const int32_t p = kv_limit(q_len, seq_len, tok);
+  if (causal) return p;
+  return window > 0 && seq_len - 1 - p >= window ? p + window - 1 : seq_len - 1;
+}
+
+// First KV position any row of the tile sees: lo of its first token. The
+// loader zero-fills the tokens of the first tile below it.
+PTH_HD int32_t kv_window_range_begin(const RowTile& t, int32_t window) {
+  return kv_window_lo(t.q_len, t.seq_len, t.tok_begin, window);
+}
+
+// One past the last KV position any row of the tile sees: hi of its last
+// token, + 1.
+PTH_HD int32_t kv_window_range_end(const RowTile& t, int32_t window,
+                                   bool causal) {
+  return kv_window_hi(t.q_len, t.seq_len, t.tok_begin + t.num_tok - 1, window,
+                      causal) +
+         1;
+}
+
+// The largest lo of the tile (its last token): positions at or above it,
+// and at or below kv_window_min_hi, are visible to every real row.
+PTH_HD int32_t kv_window_max_lo(const RowTile& t, int32_t window) {
+  return kv_window_lo(t.q_len, t.seq_len, t.tok_begin + t.num_tok - 1, window);
+}
+
+// The smallest hi of the tile (its first token).
+PTH_HD int32_t kv_window_min_hi(const RowTile& t, int32_t window, bool causal) {
+  return kv_window_hi(t.q_len, t.seq_len, t.tok_begin, window, causal);
+}
+
+// The KV tile holding range_begin: the windowed CTA's tiles start there
+// (rounded down, so the first tile may start below the range; the loader
+// zero-fills and the mask hides those tokens).
+PTH_HD int32_t kv_first_tile(int32_t range_begin, int32_t tile_tokens) {
+  return range_begin / tile_tokens;
+}
+
+// Tiles [begin, end) of split `split` for a windowed CTA: split_tile_range
+// over the tiles from kv_first_tile(range_begin) to ceil(range_end / N),
+// offset by the first tile. With range_begin = 0 it is the causal partition.
+PTH_HD void window_split_tile_range(int32_t split, int32_t num_splits,
+                                    int32_t range_begin, int32_t range_end,
+                                    int32_t tile_tokens, int32_t& begin,
+                                    int32_t& end) {
+  const int32_t first = kv_first_tile(range_begin, tile_tokens);
+  split_tile_range(split, num_splits,
+                   num_kv_tiles(range_end, tile_tokens) - first, begin, end);
+  begin += first;
+  end += first;
+}
+
+// True iff some (row, token) pair of KV tile `tile` lies outside its row's
+// window. Exact by the argument of tile_needs_mask, once per side: the tile's
+// first token against the last row (largest lo) and its last token against
+// the first row (smallest hi) are the worst pairs. Covers the zero-filled
+// tokens below the range begin and past the range end.
+PTH_HD bool tile_needs_window_mask(int32_t tile, int32_t tile_tokens,
+                                   int32_t max_lo, int32_t min_hi) {
+  const int64_t first = static_cast<int64_t>(tile) * tile_tokens;
+  return first < max_lo || first + tile_tokens - 1 > min_hi;
 }
 
 }  // namespace pth_attn

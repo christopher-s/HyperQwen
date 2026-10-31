@@ -32,7 +32,15 @@ OUT = os.path.expanduser(
 
 DOC_TOKENS = 25000
 _corpus = os.path.expanduser("~/bench/labd_corpus.txt")
-doc = open(_corpus).read()[: int(DOC_TOKENS * 2.9)] if os.path.exists(_corpus) else ""
+try:
+    with open(_corpus, encoding="utf-8") as f:
+        doc = f.read()[: int(DOC_TOKENS * 2.9)]
+except FileNotFoundError:
+    print(f"INVALID: {_corpus} is missing; run bench/labd_bench.py once to build the frozen LABD corpus before recording", file=sys.stderr)
+    sys.exit(2)
+if not doc.strip() or len(doc) < int(DOC_TOKENS * 2.9):
+    print(f"INVALID: {_corpus} is blank or too short for the document demo", file=sys.stderr)
+    sys.exit(2)
 
 # English throughout: the demo is the repo's front page, and the frame should be
 # readable by anyone landing on it. No max_tokens -- each answer runs to its own
@@ -58,7 +66,7 @@ def run(key, label, content, max_tokens=None):
                "chat_template_kwargs": {"enable_thinking": False}}
     if max_tokens:
         payload["max_tokens"] = max_tokens
-    t0 = time.time()
+    t0 = time.perf_counter()
     first = None
     toks = []          # (ms since first token, text)
     usage = {}
@@ -68,11 +76,11 @@ def run(key, label, content, max_tokens=None):
         for ch in ev.get("choices", []):
             piece = ch.get("delta", {}).get("content")
             if piece:
-                now = time.time()
+                now = time.perf_counter()
                 if first is None:
                     first = now
                 toks.append([round((now - first) * 1000, 1), piece])
-    end = time.time()
+    end = time.perf_counter()
     ttft = (first or end) - t0
     decode_s = end - (first or end)
     n = usage.get("completion_tokens", len(toks))

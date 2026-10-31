@@ -4,16 +4,16 @@
 // loader.cuh: global -> shared copy of one 64-token KV tile, and the two-stage
 // cp.async pipeline discipline around it.
 //
-// Two variants (plan C1, ADR-0006):
+// Two variants:
 //
 //   Separate streams (D = 64, 128, and any layout that is not an inline
 //   cell). K, V, k_scale and v_scale are four streams with their own views
 //   and their own cp.async width w in {16, 8, 4}, picked on the host from
 //   alignment (cache_geometry.cuh stream_width; vLLM's inline cell gives K 8,
 //   V 4, scales 4; #56164's decoupled layout K/V 16). Destination: the
-//   swizzled StageLayout of smem_layout.cuh (ADR-0007).
+//   swizzled StageLayout of smem_layout.cuh.
 //
-//   Whole cell (the shipped default at D = 256, ADR 0012 Amendment 1).
+//   Whole cell (the shipped default at D = 256).
 //   vLLM's inline cell [K D | ks | V D | vs] (2D + 8 B) is one contiguous run
 //   per (token, head), so one stream with one width (8 B for vLLM's layout:
 //   520 = 65 x 8) copies all four, into CellStageLayout (pitch 2D + 16). Only
@@ -43,8 +43,17 @@
 //
 // Tokens at or past `tok_end` (the CTA's KV range end) are zero-filled with
 // cp.async's src-size operand (0 bytes read, w zero bytes written), so stale
-// shared memory or a poisoned scale beyond the range never reaches the math
-// (error-budget K6). block_table is not read for them.
+// shared memory or a poisoned scale beyond the range never reaches the math.
+// block_table is not read for them.
+//
+// The windowed kernels also zero-fill the tokens below
+// `tok_begin` (the CTA's KV range begin; their first tile may start below
+// it): the same src-size 0 copy, so an evicted window page (vLLM maps it to
+// the null block) is never read, its block_table entry included. That path is
+// a template parameter (kLower) of the functions below, false by default, so
+// the causal kernels compile to the code they had before it existed.
+// Separate streams only: the whole-cell loader serves
+// D = 256, which has no windowed kernel.
 //
 // Host emulation: the per-lane code is written once as PTH_HD templates over
 // two small policies, a broadcast (device: __shfl_sync; host: a lookup in the
@@ -72,15 +81,16 @@ static_assert(2 * kLoaderTokensPerWarp == kWarpSize,
 static_assert(kWarps % 2 == 0, "warps pair up as w and w ^ 1");
 constexpr uint32_t kFullWarpMask = 0xFFFFFFFFu;
 
-// Unroll factor of the chunk loops (ADR-0006). Full unrolling lets ptxas
+// Unroll factor of the chunk loops. Full unrolling lets ptxas
 // hoist every iteration's shuffled row offset: 255 registers and a 204-B
 // spill at D = 256 in the test kernel, impossible next to the attention
-// math (R2). Static sm_86 SASS of the test kernels, registers and
+// math. Static sm_86 SASS of the test kernels, registers and
 // instructions per LDGSTS in the loop bodies:
 //   unroll 1: 38-40 regs, ~27 instr/LDGSTS;  unroll 2: 35-45 regs, ~21;
 //   unroll 4: 36-64 regs, ~18;  unroll 8: 40-127 regs;  full: 254-255 + spill.
 // 2 is the smallest register footprint with less loop overhead than 1. The
-// G2 register gate on the real kernel and its timing decide whether to move.
+// register gate of the real kernel (tools/ptxas_gate.py) and its timing decide
+// whether to move.
 constexpr int kLoaderUnroll = 2;
 // Spelled so that g++ -Wall does not warn about an unknown pragma.
 #if defined(__CUDACC__)
@@ -144,17 +154,19 @@ struct LaneRows {
   int64_t k;      // K row (separate) or whole cell (cell variant)
   int64_t v;      // V row
   int64_t scale;  // this lane's scale: k_scale (lane < 16) or v_scale
-  bool valid;     // token < tok_end
+  bool valid;     // tok_begin <= token < tok_end
 };
 
 // Resolves lane_token(warp, lane) of KV tile `tile` of request `req`, head
-// `kv_head`. Reads block_table only for tokens inside the KV range.
+// `kv_head`. Reads block_table only for tokens inside the KV range (with
+// kLower, also excluding tokens below tok_begin).
+template <bool kLower = false>
 PTH_HD LaneRows resolve_lane(const KernelParams& p, int32_t req,
                              int32_t kv_head, int32_t tile, int32_t tok_end,
-                             int warp, int lane) {
+                             int warp, int lane, int32_t tok_begin = 0) {
   LaneRows r{0, 0, 0, false};
   const int32_t pos = tile * kLoadTileTokens + lane_token(warp, lane);
-  if (pos >= tok_end) return r;
+  if (pos >= tok_end || (kLower && pos < tok_begin)) return r;
   uint32_t slot = 0;
   const int64_t page = token_page(p, req, static_cast<uint32_t>(pos), slot);
   r.k = p.stream[kStreamK].offset(page, slot, kv_head);
@@ -168,6 +180,13 @@ PTH_HD LaneRows resolve_lane(const KernelParams& p, int32_t req,
 PTH_HD int warp_valid_tokens(int32_t tile, int32_t tok_end, int warp) {
   const int32_t first = tile * kLoadTileTokens + kLoaderTokensPerWarp * warp;
   const int32_t n = tok_end - first;
+  return n < 0 ? 0 : (n > kLoaderTokensPerWarp ? kLoaderTokensPerWarp : n);
+}
+
+// Tokens of `warp`'s 16 that lie below the KV range begin: 0..16 (kLower).
+PTH_HD int warp_skip_tokens(int32_t tile, int32_t tok_begin, int warp) {
+  const int32_t first = tile * kLoadTileTokens + kLoaderTokensPerWarp * warp;
+  const int32_t n = tok_begin - first;
   return n < 0 ? 0 : (n > kLoaderTokensPerWarp ? kLoaderTokensPerWarp : n);
 }
 
@@ -202,14 +221,16 @@ PTH_HD int32_t cell_layout_width(const KernelParams& p) {
 //        copies n (0 or W) bytes and zero-fills the rest of the W.
 // ---------------------------------------------------------------------------
 
-// One K or V stream of one warp, width kW.
+// One K or V stream of one warp, width kW. Tokens [skip, valid) of the warp
+// are copied (skip is 0 unless kLower).
 #if defined(__CUDACC__)
   #pragma nv_exec_check_disable
 #endif
-template <int D, int kW, bool kIsV, class Bcast, class Copy>
+template <int D, int kW, bool kIsV, bool kLower = false, class Bcast,
+          class Copy>
 PTH_HD void issue_kv_stream(const StreamGeometry& g, int64_t my_row, int warp,
                             int lane, int valid, const Bcast& bcast,
-                            const Copy& copy) {
+                            const Copy& copy, int skip = 0) {
   using St = StageLayout<D, kLoadTileTokens>;
   PTH_LOADER_UNROLL
   for (int it = 0; it < stream_iters<D, kW>(); ++it) {
@@ -220,7 +241,7 @@ PTH_HD void issue_kv_stream(const StreamGeometry& g, int64_t my_row, int warp,
     const int t = kLoaderTokensPerWarp * warp + c.token;  // token in the tile
     const uint32_t dst =
         kIsV ? St::kV + v_swz(t, c.byte, D) : St::kK + k_swz(t, c.byte, D);
-    const bool ok = c.token < valid;
+    const bool ok = c.token < valid && (!kLower || c.token >= skip);
     copy.template op<kW>(dst, ok ? g.base + row + c.byte : g.base,
                          ok ? static_cast<uint32_t>(kW) : 0u);
   }
@@ -231,41 +252,45 @@ PTH_HD void issue_kv_stream(const StreamGeometry& g, int64_t my_row, int warp,
 #if defined(__CUDACC__)
   #pragma nv_exec_check_disable
 #endif
-template <int D, bool kIsV, class Bcast, class Copy>
+template <int D, bool kIsV, bool kLower = false, class Bcast, class Copy>
 PTH_HD void issue_kv_stream_any_width(const StreamGeometry& g, int64_t my_row,
                                       int warp, int lane, int valid,
-                                      const Bcast& bcast, const Copy& copy) {
+                                      const Bcast& bcast, const Copy& copy,
+                                      int skip = 0) {
   switch (g.width) {
     case kGeomWidth16:
-      issue_kv_stream<D, kGeomWidth16, kIsV>(g, my_row, warp, lane, valid,
-                                             bcast, copy);
+      issue_kv_stream<D, kGeomWidth16, kIsV, kLower>(g, my_row, warp, lane,
+                                                     valid, bcast, copy, skip);
       break;
     case kGeomWidth8:
-      issue_kv_stream<D, kGeomWidth8, kIsV>(g, my_row, warp, lane, valid, bcast,
-                                            copy);
+      issue_kv_stream<D, kGeomWidth8, kIsV, kLower>(g, my_row, warp, lane,
+                                                    valid, bcast, copy, skip);
       break;
     default:
-      issue_kv_stream<D, kGeomWidth4, kIsV>(g, my_row, warp, lane, valid, bcast,
-                                            copy);
+      issue_kv_stream<D, kGeomWidth4, kIsV, kLower>(g, my_row, warp, lane,
+                                                    valid, bcast, copy, skip);
       break;
   }
 }
 
-// Separate streams: one lane's share of loading `tile` into a stage.
+// Separate streams: one lane's share of loading `tile` into a stage. With
+// kLower, `mine` must come from resolve_lane<true> with the same tok_begin.
 #if defined(__CUDACC__)
   #pragma nv_exec_check_disable
 #endif
-template <int D, class BcastK, class BcastV, class Copy>
+template <int D, bool kLower = false, class BcastK, class BcastV, class Copy>
 PTH_HD void issue_tile_separate_lane(const KernelParams& p,
                                      const LaneRows& mine, int32_t tile,
                                      int32_t tok_end, int warp, int lane,
                                      const BcastK& bcast_k,
-                                     const BcastV& bcast_v, const Copy& copy) {
+                                     const BcastV& bcast_v, const Copy& copy,
+                                     int32_t tok_begin = 0) {
   const int valid = warp_valid_tokens(tile, tok_end, warp);
-  issue_kv_stream_any_width<D, false>(p.stream[kStreamK], mine.k, warp, lane,
-                                      valid, bcast_k, copy);
-  issue_kv_stream_any_width<D, true>(p.stream[kStreamV], mine.v, warp, lane,
-                                     valid, bcast_v, copy);
+  const int skip = kLower ? warp_skip_tokens(tile, tok_begin, warp) : 0;
+  issue_kv_stream_any_width<D, false, kLower>(p.stream[kStreamK], mine.k, warp,
+                                              lane, valid, bcast_k, copy, skip);
+  issue_kv_stream_any_width<D, true, kLower>(p.stream[kStreamV], mine.v, warp,
+                                             lane, valid, bcast_v, copy, skip);
   // Both scale streams in one 4-B instruction (see the file comment). Scale
   // rows are one f32, so their width is always 4.
   const StreamGeometry& g = p.stream[scale_stream(lane)];
@@ -340,17 +365,23 @@ struct HostBcast {
 
 // Runs all 128 threads of one tile load in program order. `stage` must hold
 // the stage image (StageLayout or CellStageLayout bytes); bytes the loader
-// does not write are left as they are.
+// does not write are left as they are. tok_begin > 0 runs the windowed
+// (kLower) path, separate streams only.
 template <int D>
 inline void emulate_tile(const KernelParams& p, bool whole_cell,
                          int32_t cell_width, uint8_t* stage, int32_t req,
-                         int32_t kv_head, int32_t tile, int32_t tok_end) {
+                         int32_t kv_head, int32_t tile, int32_t tok_end,
+                         int32_t tok_begin = 0) {
   const HostCopy copy{stage};
+  const bool lower = tok_begin > 0;
   for (int warp = 0; warp < kWarps; ++warp) {
     LaneRows rows[kWarpSize];
     int64_t k[kWarpSize], v[kWarpSize];
     for (int lane = 0; lane < kWarpSize; ++lane) {
-      rows[lane] = resolve_lane(p, req, kv_head, tile, tok_end, warp, lane);
+      rows[lane] =
+          lower ? resolve_lane<true>(p, req, kv_head, tile, tok_end, warp, lane,
+                                     tok_begin)
+                : resolve_lane(p, req, kv_head, tile, tok_end, warp, lane);
       k[lane] = rows[lane].k;
       v[lane] = rows[lane].v;
     }
@@ -358,6 +389,10 @@ inline void emulate_tile(const KernelParams& p, bool whole_cell,
       if (whole_cell) {
         issue_tile_cell_lane<D>(p, rows[lane], cell_width, tile, tok_end, warp,
                                 lane, HostBcast{k}, copy);
+      } else if (lower) {
+        issue_tile_separate_lane<D, true>(p, rows[lane], tile, tok_end, warp,
+                                          lane, HostBcast{k}, HostBcast{v},
+                                          copy, tok_begin);
       } else {
         issue_tile_separate_lane<D>(p, rows[lane], tile, tok_end, warp, lane,
                                     HostBcast{k}, HostBcast{v}, copy);
@@ -387,18 +422,18 @@ struct DeviceCopy {
 
 // Issues (does not wait for) the cp.async of KV tile `tile` into the stage at
 // `stage_smem`. All 128 threads must call it (shuffles are warp-collective).
-template <int D>
-__device__ __forceinline__ void load_tile_separate(const KernelParams& p,
-                                                   uint32_t stage_smem,
-                                                   int32_t req, int32_t kv_head,
-                                                   int32_t tile,
-                                                   int32_t tok_end) {
+// kLower also zero-fills the tokens below tok_begin (windowed kernels).
+template <int D, bool kLower = false>
+__device__ __forceinline__ void load_tile_separate(
+    const KernelParams& p, uint32_t stage_smem, int32_t req, int32_t kv_head,
+    int32_t tile, int32_t tok_end, int32_t tok_begin = 0) {
   const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
   const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
-  const LaneRows mine =
-      resolve_lane(p, req, kv_head, tile, tok_end, warp, lane);
-  issue_tile_separate_lane<D>(p, mine, tile, tok_end, warp, lane, DeviceBcast{},
-                              DeviceBcast{}, DeviceCopy{stage_smem});
+  const LaneRows mine = resolve_lane<kLower>(p, req, kv_head, tile, tok_end,
+                                             warp, lane, tok_begin);
+  issue_tile_separate_lane<D, kLower>(p, mine, tile, tok_end, warp, lane,
+                                      DeviceBcast{}, DeviceBcast{},
+                                      DeviceCopy{stage_smem}, tok_begin);
 }
 
 template <int D>
@@ -415,7 +450,7 @@ __device__ __forceinline__ void load_tile_cell(const KernelParams& p,
                           DeviceBcast{}, DeviceCopy{stage_smem});
 }
 
-// The two-stage pipeline over KV tiles [begin, end) (plan 3.4 step 3):
+// The two-stage pipeline over KV tiles [begin, end):
 //
 //   issue(begin -> stage 0); commit
 //   for i in [begin, end):

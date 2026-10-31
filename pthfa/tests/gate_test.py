@@ -10,15 +10,18 @@ what makes the package safe to ship in every image while only PTH_FA=1 uses it:
      backend under AttentionBackendEnum.CUSTOM, idempotently, and never over another plugin's CUSTOM;
   3. inert unless selected: CUSTOM is in no automatic-selection list of this vLLM, for any compute
      capability or KV dtype, so a server without --attention-backend CUSTOM never reaches it;
-  4. the backend's declared limits (sm_8x, head sizes 64/128/256, int8_per_token_head, causal
-     decoder self-attention, no sliding window, ALiBi, sinks, soft cap);
+  4. the backend's declared limits (sm_8x, head sizes 64/128/256, int8_per_token_head, decoder
+     self-attention; sliding window and non-causal attention at head size 128 only, the DFlash2
+     drafter's layers; no ALiBi, sinks, soft cap, bidirectional mm prefix or R-SWA);
   5. an explicit selection the kernel cannot serve fails at load with its reason, before anything is
-     allocated (sliding window, ALiBi, sinks, soft cap, another KV dtype, another head size);
+     allocated (a sliding window or non-causal attention at head size 64 or 256, ALiBi, sinks, soft
+     cap, another KV dtype, another head size), and the drafter's shape is accepted;
   6. this vLLM's speculative config accepts "attention_backend":"CUSTOM" and copies it onto the
-     drafter's config, which is how PTH_FA=1 puts the MTP drafter on the same backend.
+     drafter's config, which is how PTH_FA=1 puts the MTP or DFlash2 drafter on the same backend.
 
   CUDA_VISIBLE_DEVICES= venv/bin/python pthfa/tests/gate_test.py
 """
+import dataclasses
 import importlib.metadata as metadata
 import sys
 from pathlib import Path
@@ -119,16 +122,19 @@ def main():
           "head sizes 64, 128, 256 only")
     ok_caps = [f"{c.major}.{c.minor}" for c in caps if backend.supports_compute_capability(c)]
     check(ok_caps == ["8.0", "8.6", "8.9"], f"compute capability 8.0/8.6/8.9 only -> {ok_caps}")
-    check(not any((backend.supports_sliding_window(), backend.supports_sink(), backend.supports_non_causal(),
-                   backend.supports_alibi_sqrt(), backend.supports_mm_prefix())),
-          "no sliding window, sinks, non-causal, ALiBi or bidirectional mm prefix")
+    check(backend.supports_sliding_window() and backend.supports_non_causal(),
+          "sliding window and non-causal attention supported (at head size 128, below)")
+    check(not any((backend.supports_sink(), backend.supports_alibi_sqrt(), backend.supports_mm_prefix(),
+                   backend.supports_rswa())),
+          "no sinks, ALiBi, bidirectional mm prefix or R-SWA")
     check(backend.supports_block_size(816) and backend.supports_block_size(16) and not backend.supports_block_size(8),
           "block sizes: multiples of 16 (the hybrid group's 816 included)")
 
     base = dict(num_heads=24, head_size=256, scale=0.0625, num_kv_heads=4, alibi_slopes=None,
                 sliding_window=None, kv_cache_dtype="int8_per_token_head")
     refusals = {
-        "sliding window": dict(sliding_window=4096),
+        "sliding window at head size 256": dict(sliding_window=4096),
+        "sliding window at head size 64": dict(sliding_window=4096, head_size=64, num_heads=16),
         "ALiBi": dict(alibi_slopes=[0.5] * 24),
         "attention sinks": dict(sinks=torch.zeros(24)),
         "logits soft cap": dict(logits_soft_cap=30.0),
@@ -144,12 +150,44 @@ def main():
             got = str(e)
         check(reason in got, f"explicit selection with {reason} refused at load: {got[:90]}")
 
+    # The DFlash2 drafter's layers (TP=2 per rank, and TP=1): D = 128, sliding window 2048, non-causal.
+    for heads, kv_heads in ((16, 4), (32, 8)):
+        try:
+            impl = PthFlashAttnImpl(**{**base, "num_heads": heads, "num_kv_heads": kv_heads, "head_size": 128,
+                                       "scale": 128 ** -0.5, "sliding_window": 2048})
+            got = f"constructed, window {impl.window}"
+        except Exception as e:  # noqa: BLE001 -- any failure is the finding
+            got = f"{type(e).__name__}: {e}"
+        check(got == "constructed, window 2048",
+              f"accepted at load: D=128, {heads}/{kv_heads} heads, sliding window 2048 -> {got[:90]}")
+
+    def reasons(head_size, **flags):
+        args = dict(head_size=head_size, dtype=torch.bfloat16, kv_cache_dtype="int8_per_token_head", block_size=864,
+                    use_mla=False, has_sink=False, use_sparse=False, use_mm_prefix=False,
+                    use_per_head_quant_scales=False, device_capability=DeviceCapability(8, 6), attn_type="decoder")
+        return backend.validate_configuration(**{**args, **flags})
+
+    drafter = reasons(128, has_sliding_window=True, use_non_causal=True)
+    check(drafter == [], f"selection: the drafter's layers (D=128, window, non-causal, block 864) -> {drafter}")
+    for hs in (256, 64):
+        got = reasons(hs, has_sliding_window=True, use_non_causal=True)
+        check(len(got) == 2 and all(f"at head size {hs}" in r for r in got),
+              f"selection: a window and non-causal at head size {hs} refused -> {[r[:40] for r in got]}")
+    for what, flag, reason in (("sinks", "has_sink", "attention sinks not supported"),
+                               ("mm prefix", "use_mm_prefix", "partial multimodal token full attention"),
+                               ("R-SWA", "use_rswa", "R-SWA not supported")):
+        got = reasons(128, has_sliding_window=True, use_non_causal=True, **{flag: True})
+        check(any(reason in r for r in got), f"selection: the drafter's shape with {what} refused -> {got}")
+
     from vllm.config.speculative import _DRAFT_VLLM_CONFIG_OVERRIDES, SpeculativeConfig
 
     check(SpeculativeConfig._parse_attention_backend("CUSTOM") is custom,
           'speculative config parses "attention_backend":"CUSTOM"')
     check(("attention_backend", "attention_config", "backend") in _DRAFT_VLLM_CONFIG_OVERRIDES,
           "the drafter's config takes the speculative config's attention_backend")
+    spec_kv = {f.name: f.default for f in dataclasses.fields(SpeculativeConfig)}.get("kv_cache_dtype", "absent")
+    check(spec_kv is None, f"the speculative config's kv_cache_dtype defaults to None (the drafter keeps the target's "
+                           f"cache dtype unless it is set) -> {spec_kv}")
 
     print(f"pthfa gate test: {'OK' if not FAILS else f'{len(FAILS)} FAILED'}")
     return 1 if FAILS else 0

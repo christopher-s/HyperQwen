@@ -13,8 +13,11 @@ set -e
 # shellcheck disable=SC1091
 source "$(dirname "$(cd "$(dirname "$0")" && pwd)")/launcher_common.sh" \
   || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
+qwen_normalize_extra_args
 qwen_check_bool_knobs
+qwen_fa2_fp8kv_single_only alternative.sh
 qwen_kv_offload_args
+qwen_prefix_cache
 
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
   ALLOC_DEFAULT=expandable_segments:False
@@ -89,8 +92,15 @@ case "$SPEC" in
   *) echo "SPEC=$SPEC is not a mode here: dflash2 (default) or off." >&2; exit 1 ;;
 esac
 PORT=${PORT:-18020}
-GPU_UTIL=${GPU_UTIL:-0.95}   # 0.93 on WSL2 or with a desktop compositor on the card
-MAX_LEN=${MAX_LEN:-256000}   # 256000 needs the full 0.95; drop MAX_LEN before GPU_UTIL
+# Under WSL2 vLLM sees less than the nominal 24 GiB (22.75 GiB free on a 3090, #401), so 0.95 asks for more
+# than exists and the profile fails to start; 0.93 boots and holds the 256k window (446,128-token pool).
+# An explicit GPU_UTIL always wins; with a desktop compositor on the card, lower it yourself.
+if [ -z "${GPU_UTIL:-}" ] && { grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; }; then
+  GPU_UTIL=0.93
+  echo "WSL detected: GPU_UTIL=0.93 (0.95 exceeds the free memory WSL2 reports; set GPU_UTIL to override)"
+fi
+GPU_UTIL=${GPU_UTIL:-0.95}
+MAX_LEN=${MAX_LEN:-256000}   # 256000 needs the full 0.95 on native Linux; drop MAX_LEN before GPU_UTIL
 ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int4_per_token_head"
 VISION=${VISION:-0}
 ENABLE_THINKING=${ENABLE_THINKING:-false}
@@ -100,20 +110,16 @@ MAX_SEQS=${MAX_SEQS:-1}
 CG=$(( MAX_SEQS * (DRAFT_TOKENS + 1) > 64 ? 64 : MAX_SEQS * (DRAFT_TOKENS + 1) ))
 # DFLASH_TOKENS>7 needs the synchronous scheduler, same as start_qwen.sh.
 if [ "$DRAFT_TOKENS" -gt 7 ]; then ASYNC_SCHED=${ASYNC_SCHED:-0}; else ASYNC_SCHED=${ASYNC_SCHED:-1}; fi
-PREFIX_CACHE=${PREFIX_CACHE:-1}
 
-VISION_ARGS="--language-model-only"
-[ "$VISION" = 1 ] && VISION_ARGS='--mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+qwen_vision_args
 
-PREFIX_ARGS=""
-[ "$PREFIX_CACHE" = 1 ] && PREFIX_ARGS="--enable-prefix-caching --mamba-cache-mode align"
 # With the drafter on, pass the retention interval explicitly: 0.30's unset default is 0 (the replay
 # boundaries only), where 0.29 resolved it to dense (vllm #55760); start_qwen.sh has the measurement.
 # The default here depends on a KV tier (the connector check above): without one it is 0, because at dense two
 # ~60K conversations on this int4 pool evicted each other completely (0 / 0 cached where 0 held 93.5% for both);
 # with one it is None (dense), which the tier serves from (gotcha 60). PREFIX_RETENTION sets it (0 = boundaries
 # only, empty = dense); the flag in EXTRA_ARGS wins.
-if [ "$PREFIX_CACHE" = 1 ] && [ "$SPEC" = dflash2 ]; then
+if [ "$PREFIX_CACHE_ON" = 1 ] && [ "$SPEC" = dflash2 ]; then
   case " ${EXTRA_ARGS:-} " in
     *"--prefix-cache-retention-interval"*) ;;
     *)
@@ -122,7 +128,7 @@ if [ "$PREFIX_CACHE" = 1 ] && [ "$SPEC" = dflash2 ]; then
         *) R_DEFAULT=0 ;;
       esac
       if [ "${PREFIX_RETENTION+set}" = set ]; then R=${PREFIX_RETENTION:-None}; else R=$R_DEFAULT; fi
-      PREFIX_ARGS="$PREFIX_ARGS --prefix-cache-retention-interval $R" ;;
+      EXTRA_ARGS="--prefix-cache-retention-interval $R ${EXTRA_ARGS:-}" ;;
   esac
 fi
 
@@ -154,7 +160,7 @@ qwen_exec vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count 1 \
-  ${VISION_ARGS} \
+  "${VISION_ARGS[@]}" \
   ${ATTN_ARGS} \
   --mamba-ssm-cache-dtype float16 \
   "${ASYNC_ARGS[@]}" \
@@ -167,5 +173,4 @@ qwen_exec vllm serve "$MODEL" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --tool-strict-level "${TOOL_STRICT:-parameter}" \
   --default-chat-template-kwargs "{\"enable_thinking\": $ENABLE_THINKING}" \
-  ${PREFIX_ARGS} \
   ${EXTRA_ARGS}

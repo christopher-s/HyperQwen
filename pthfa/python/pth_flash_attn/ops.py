@@ -22,7 +22,7 @@ stay in C++ only.
 
 Importing this module loads ``_C.abi3.so`` if it has been built (it is a pure
 op library without ``PyInit``, so it is loaded with ``torch.ops.load_library``,
-not imported). There is no torch.cuda call here (rule 6): device questions are
+not imported). There is no torch.cuda call here: device questions are
 answered by the C++ side or by vLLM's ``current_platform``.
 """
 
@@ -37,25 +37,26 @@ from pth_flash_attn.planner import (
     MAX_ROWS_PER_CTA,
     MMA_ROWS_PER_WARP,
     SUPPORTED_HEAD_SIZES,
+    WINDOWED_HEAD_SIZES,
     WM_CHOICES,
 )
 
 OP_NAMESPACE = "pth_flash_attn"
 OP_NAME = "pth_flash_attn_fwd"
 OP_QUALNAME = f"{OP_NAMESPACE}::{OP_NAME}"
-# Frozen interface, plan §4.1, identical to the m.def() text in
+# Frozen interface (docs/api.md), identical to the m.def() text in
 # csrc/pth_attn/torch_bindings.cpp (tests parse all three and compare).
 # `Tensor!` marks the three tensors the op writes in place (out-variant).
 OP_SCHEMA = (
     "pth_flash_attn_fwd(Tensor! out, Tensor q, Tensor k_cache, "
     "Tensor v_cache, Tensor k_scale, Tensor v_scale, Tensor block_table, "
     "Tensor seq_lens, Tensor query_start_loc, int max_query_len, int wm, "
-    "int num_splits, float softmax_scale, Tensor! ws_o, Tensor! ws_lse) "
-    "-> ()"
+    "int num_splits, float softmax_scale, Tensor! ws_o, Tensor! ws_lse, "
+    "int window=0, bool causal=True) -> ()"
 )
 LIBRARY_PATH = Path(__file__).with_name("_C.abi3.so")
 
-# Ranks of the op's tensors, from the layouts in plan §4.1:
+# Ranks of the op's tensors, from the layouts in docs/api.md:
 # q/out [T, Hq, D]; caches [NB, BS, Hkv, D]; scales [NB, BS, Hkv];
 # block_table [num_reqs, max_blocks]; seq_lens [num_reqs];
 # query_start_loc [num_reqs + 1]; ws_o [S, T, Hq, D]; ws_lse [S, T, Hq].
@@ -137,6 +138,8 @@ def _check_metadata(
     softmax_scale: float,
     ws_o: torch.Tensor,
     ws_lse: torch.Tensor,
+    window: int = 0,
+    causal: bool = True,
 ) -> None:
     # Same order and messages as check_metadata() in csrc/pth_attn/launch.cu,
     # so the first failing check, and so the message, is the same on both
@@ -218,6 +221,13 @@ def _check_metadata(
     if not (math.isfinite(softmax_scale) and softmax_scale > 0.0):
         # :g prints a double the way C++ ostream does by default (-1 not -1.0).
         _fail("softmax_scale must be finite and > 0, got ", f"{softmax_scale:g}")
+    if window < 0:
+        _fail("window must be >= 0, got ", window)
+    if (window > 0 or not causal) and head_size not in WINDOWED_HEAD_SIZES:
+        _fail(
+            "sliding-window and non-causal attention need head size D = 128, got ",
+            head_size,
+        )
 
     for t, name in (
         (out, "out"),
@@ -231,7 +241,7 @@ def _check_metadata(
     ):
         _check_same_device(t, q, name)
 
-    # Workspace is read only when S > 1 (plan §4.1). Its leading sizes may
+    # Workspace is read only when S > 1 (docs/api.md). Its leading sizes may
     # exceed S and T (a larger view still works); Hq and D must match.
     if num_splits > 1:
         _check_dim(ws_o, _RANK_WS_O, "ws_o")
@@ -287,6 +297,8 @@ def pth_flash_attn_fwd_fake(
     softmax_scale: float,
     ws_o: torch.Tensor,
     ws_lse: torch.Tensor,
+    window: int = 0,
+    causal: bool = True,
 ) -> None:
     """Fake (meta) kernel: validate metadata like C++, write nothing, return None.
 
@@ -310,6 +322,8 @@ def pth_flash_attn_fwd_fake(
         softmax_scale,
         ws_o,
         ws_lse,
+        window,
+        causal,
     )
 
 
@@ -347,13 +361,22 @@ def pth_flash_attn_fwd(
     softmax_scale: float,
     ws_o: torch.Tensor,
     ws_lse: torch.Tensor,
+    window: int = 0,
+    causal: bool = True,
 ) -> None:
     """Run paged int8 attention for one launch, writing ``out`` in place.
 
-    Arguments follow the frozen schema (plan §4.1). ``wm`` and ``num_splits``
+    Arguments follow the frozen schema (docs/api.md). ``wm`` and ``num_splits``
     come from ``planner.plan_launch`` for this slice of the batch; ``ws_o`` and
-    ``ws_lse`` are views of the load-time workspace with the plan's
+    ``ws_lse`` are views of the load-time workspace with the launch plan's
     ``ws_o_shape``/``ws_lse_shape`` (may be empty when ``num_splits == 1``).
+    ``window`` (0 = none) and ``causal`` are layer constants (vLLM's sliding
+    window and non-causal flag): the query at position p sees keys ``[lo, hi]`` with
+    ``lo = max(0, p - W + 1)`` (0 when W = 0) and ``hi = p`` if causal, else
+    ``min(seq_len - 1, p + W - 1)`` (``seq_len - 1`` when W = 0).
+    ``window > 0`` or ``causal=False`` needs D = 128. The defaults
+    ``window=0, causal=True`` (also in the schema, so a 15-argument call from
+    before the window existed still resolves) are the causal kernel unchanged.
     The call allocates nothing and reads no device data on the host.
 
     Raises:
@@ -382,4 +405,6 @@ def pth_flash_attn_fwd(
         softmax_scale,
         ws_o,
         ws_lse,
+        window,
+        causal,
     )

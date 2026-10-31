@@ -42,19 +42,22 @@ untouched. VLLM_GDN_BA_PAD_SMALL_M=0 turns it off. The cliff is a cuBLAS heurist
 may not exist on other GPUs or cuBLAS versions; where it does not, the pad costs ~1.5 us
 per call (6.7 against 4.9).
 
+LoRA-enabled models retain the normal layer forward: the adapter wrapper is installed after
+construction, and a raw base-weight projection would omit its contribution.
+
 Env knobs this patch reads go through vllm.envs: VLLM_GDN_BA_PAD_SMALL_M (registered here).
 
 Kind: feature
 What: pad 2-4 token batches of the bf16 GDN `in_proj_ba` GEMM to 5 rows (cuBLAS cliff at
   that shape; MTP-3 verify)
 Upstream: none
-Cut-against: 0.31.0
+Cut-against: 0.32.0
 Retires-when: upstreamed, or a cuBLAS that picks a sane kernel at M = 2..4
 
---- exported from 91d690a (gdn-ba-pad-small-m); regenerate with scripts/export-patch.sh, do not edit ---
+--- exported from daf4558 (gdn-ba-pad-small-m); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/envs.py b/envs.py
-index 27adbb0..4053ce7 100644
+index 83f6313..ce101cf 100644
 --- a/envs.py
 +++ b/envs.py
 @@ -132,6 +132,7 @@
@@ -65,7 +68,7 @@ index 27adbb0..4053ce7 100644
      VLLM_DISABLE_PYNCCL: bool = False
      VLLM_USE_OINK_OPS: bool = False
      VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
-@@ -1301,6 +1302,11 @@
+@@ -1307,6 +1308,11 @@
          ["cuda", "triton"],
          case_sensitive=False,
      ),
@@ -78,10 +81,10 @@ index 27adbb0..4053ce7 100644
      "VLLM_DISABLE_PYNCCL": lambda: (
          os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
 diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-index 9d5bcc8..f24b562 100644
+index 516ef13..976ac2c 100644
 --- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 +++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-@@ -28,6 +28,7 @@
+@@ -29,6 +29,7 @@
      ColumnParallelLinear,
      MergedColumnParallelLinear,
      RowParallelLinear,
@@ -89,14 +92,17 @@ index 9d5bcc8..f24b562 100644
  )
  from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
  from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
-@@ -532,6 +533,15 @@
-         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
-         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+@@ -619,6 +620,18 @@
+         if self.speculative_config is not None:
+             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
  
 +        # Pad 2-4 token batches of the bf16 in_proj_ba GEMM to 5 rows (see
 +        # gdn_ba_proj below). Only the plain unquantized, bias-free projection.
 +        self.ba_proj_pad_small_m = (
 +            envs.VLLM_GDN_BA_PAD_SMALL_M
++            # LoRA replaces in_proj_ba after construction. Calling F.linear on
++            # its base weight would silently omit the adapter contribution.
++            and vllm_config.lora_config is None
 +            and current_platform.is_cuda()
 +            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
 +            and self.in_proj_ba.bias is None
@@ -105,7 +111,7 @@ index 9d5bcc8..f24b562 100644
          compilation_config = get_current_vllm_config().compilation_config
          if prefix in compilation_config.static_forward_context:
              raise ValueError(f"Duplicate layer name: {prefix}")
-@@ -906,7 +916,10 @@
+@@ -993,7 +1006,10 @@
          # Part 1: Input Projection
          # ============================================================
          mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -115,9 +121,9 @@ index 9d5bcc8..f24b562 100644
 +        else:
 +            ba, _ = self.in_proj_ba(hidden_states)
  
-         use_fused_gdn_decode = (
-             self.enable_fused_gdn_decode
-@@ -1961,3 +1974,30 @@
+         use_fused_gdn_spec_decode = (
+             self.enable_fused_gdn_spec_decode
+@@ -2057,3 +2073,30 @@
      op_func=qwen_gdn_attention_core_fused_norm_packed,
      mutates_args=["core_attn_out"],
  )

@@ -43,7 +43,7 @@ PY=${PY:-$HERE/venv/bin/python}
 echo "== environment"
 [ -x "$PY" ] && ok "python: $PY" || { fail "no $PY (see README Setup)"; exit 1; }
 VER=$($PY -c "import vllm; print(vllm.__version__)" 2>/dev/null | tail -n1)
-[ "$VER" = "0.31.0" ] && ok "vllm $VER" || warn "vllm ${VER:-missing} (patches were written against 0.31.0)"
+[ "$VER" = "0.32.0" ] && ok "vllm $VER" || warn "vllm ${VER:-missing} (patches were written against 0.32.0)"
 SP=$($PY -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null | tail -n1)
 [ -n "$SP" ] && [ -d "$SP" ] && ok "vllm package at $SP" || { fail "cannot import vllm with $PY"; exit 1; }
 if [ $INSTALL = 0 ]; then
@@ -62,17 +62,18 @@ command -v nvidia-smi >/dev/null && {
 fi
 for t in triton compressed_tensors; do $PY -c "import $t" 2>/dev/null && ok "python module $t" || fail "python module $t missing"; done
 # a bare `import flashinfer` passes while vLLM still falls back to torch.topk:
-# has_flashinfer() additionally wants nvcc on PATH or the flashinfer-cubin
-# package (#35). Test what the server will actually use.
+# has_flashinfer() additionally wants the flashinfer-cubin package, or nvcc and
+# (from 0.32.0, vllm #58360) ninja on PATH (#35). Test what the server will
+# actually use: the launchers put the venv's bin, where pip installs ninja, on PATH.
 export FLASHINFER_DISABLE_VERSION_CHECK=1  # the launchers export this too (docs/install.md: harmless when the versions match)
 # The fix names the cubin for the installed flashinfer-python, from flashinfer.ai:
 # PyPI stops at 0.6.13, and the vllm wheel pins flashinfer-python exactly. This
 # line used to say flashinfer-cubin==0.6.13, a mismatch on the 0.29.0 pin (0.6.18)
 # that the check export above then hides.
-$PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer()" 2>/dev/null \
-  && ok "flashinfer usable by vLLM (nvcc or flashinfer-cubin present)" \
+PATH="$(dirname "$PY"):$PATH" $PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer()" 2>/dev/null \
+  && ok "flashinfer usable by vLLM (nvcc and ninja, or flashinfer-cubin present)" \
   || { FIV=$($PY -c "from importlib.metadata import version; print(version('flashinfer-python'))" 2>/dev/null | tail -n1)
-       fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. Put nvcc on PATH, or pip install --extra-index-url https://flashinfer.ai/whl/ flashinfer-cubin==${FIV:-<installed flashinfer-python version>} (#35)"; }
+       fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. Put nvcc on PATH and pip install ninja into the venv, or pip install --extra-index-url https://flashinfer.ai/whl/ flashinfer-cubin==${FIV:-<installed flashinfer-python version>} (#35)"; }
 
 echo "== vLLM patches (order: patches/series)"
 # A later patch can rewrite the region an earlier one added -- both still apply, in
@@ -144,6 +145,39 @@ if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
   $PY -c "from vllm.v1.attention.backends.registry import AttentionBackendEnum; AttentionBackendEnum.KVARN.get_class()" 2>/dev/null \
     && ok "KVarN backend importable (KV=kvarn / CTX=huge available)" || fail "KVarN files present but backend does not import"
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
+
+echo "== fp8-KV FA2 (optional, fa2/)"
+if $PY -c "import fa2_fp8kv_vllm" 2>/dev/null; then
+  # Each probe runs in its own interpreter: register() replaces a registry entry, which must not leak.
+  $PY -c "import fa2_fp8kv_vllm.paths as p; p.check()" 2>/dev/null \
+    && ok "fa2_fp8kv.so and fa2_fp8kv_prefill.so are in the package" || fail "fa2_fp8kv_vllm is installed without both libraries (bash fa2/install.sh)"
+  $PY - <<'EOF' 2>/dev/null && ok "both libraries load; torch.ops.fa2_fp8kv.forward and fa2_fp8kv_prefill.gather exist" || fail "a fa2 library does not load, or its op is missing (ABI: rebuild with bash fa2/install.sh)"
+import torch, fa2_fp8kv_vllm.paths as p
+torch.ops.load_library(str(p.library())); torch.ops.load_library(str(p.prefill_library()))
+torch.ops.fa2_fp8kv.forward; torch.ops.fa2_fp8kv_prefill.gather
+EOF
+  # FLASH_ATTN's class path as a fresh process sees it: native unless FA2_FP8KV=1.
+  FA2_PATH='from vllm.v1.attention.backends.registry import AttentionBackendEnum as E; import fa2_fp8kv_vllm; fa2_fp8kv_vllm.register(); print(E.FLASH_ATTN.get_path())'
+  P_OFF=$(env -u FA2_FP8KV $PY -c "$FA2_PATH" 2>/dev/null | tail -n1)
+  P_ON=$(FA2_FP8KV=1 $PY -c "$FA2_PATH" 2>/dev/null | tail -n1)
+  [ -n "$P_OFF" ] && [ "$P_OFF" != "fa2_fp8kv_vllm.backend.Fp8FlashAttentionBackend" ] \
+    && ok "register() without FA2_FP8KV=1 leaves FLASH_ATTN native ($P_OFF)" || fail "register() changed FLASH_ATTN without FA2_FP8KV=1 (got '$P_OFF')"
+  [ "$P_ON" = "fa2_fp8kv_vllm.backend.Fp8FlashAttentionBackend" ] \
+    && ok "FA2_FP8KV=1 makes register() replace FLASH_ATTN" || fail "FA2_FP8KV=1 did not replace FLASH_ATTN (got '$P_ON')"
+  $PY - <<'EOF' 2>/dev/null && ok "supported_kv_cache_layouts is None for a non-fp8 cache dtype" || fail "the fa2 backend narrows the KV layout for a non-fp8 cache dtype (it would change CTX=fast)"
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+try:
+    import vllm.vllm_flash_attn
+except ImportError:  # no libcuda.so.1 (the image build): the backend only needs the name
+    sys.modules["vllm.vllm_flash_attn"] = SimpleNamespace(flash_attn_varlen_func=None)
+from fa2_fp8kv_vllm import backend
+cfg = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
+with patch.object(backend, "get_current_vllm_config_or_none", return_value=cfg):
+    assert backend.Fp8FlashAttentionBackend.supported_kv_cache_layouts() is None
+EOF
+else printf "  INFO  fa2_fp8kv_vllm not installed (optional; bash fa2/install.sh for FA2_FP8KV=1)\n"; fi
 
 if [ $INSTALL = 0 ]; then
 echo "== model at $MODEL"
@@ -366,37 +400,50 @@ if [ -f /.dockerenv ]; then :; elif systemctl --user is-active qwen-serving >/de
 fi  # INSTALL
 
 if [ $NOSRV = 0 ]; then
-  echo "== live server (127.0.0.1:${PORT:-18020})"
   PORT=${PORT:-18020}
+  # VERIFY_SERVER_URL points the live checks at a server that is not this host's 127.0.0.1:$PORT,
+  # e.g. another Compose container (VERIFY_SERVER_URL=http://single:18020, #341).
+  SRV=${VERIFY_SERVER_URL:-http://127.0.0.1:$PORT}; SRV=${SRV%/}
+  echo "== live server ($SRV)"
   if [ "$WAIT" -gt 0 ]; then
     # Bounded poll for /health, same shape as single-user/qwen-server.sh:
     # fixed 5 s interval, at most WAIT seconds, abort if the server pid dies.
-    echo "verify: waiting up to ${WAIT}s for http://127.0.0.1:$PORT/health ..."
+    echo "verify: waiting up to ${WAIT}s for $SRV/health ..."
     _WAIT_N=$(( (WAIT + 4) / 5 )); _WAIT_HIT=0
     for _w in $(seq 1 "$_WAIT_N"); do
       if [ -n "${VERIFY_SERVER_PID:-}" ] && ! kill -0 "$VERIFY_SERVER_PID" 2>/dev/null; then
         echo "verify: server process $VERIFY_SERVER_PID exited before becoming healthy" >&2
         break
       fi
-      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/health"; then _WAIT_HIT=1; break; fi
+      if curl -sf -o /dev/null "$SRV/health"; then _WAIT_HIT=1; break; fi
       sleep 5
     done
     [ "$_WAIT_HIT" = 1 ] && echo "verify: /health 200 after waiting"
   fi
-  if curl -sf -o /dev/null http://127.0.0.1:$PORT/health; then
+  if curl -sf -o /dev/null $SRV/health; then
     ok "/health 200"
     KEY=${VLLM_API_KEY:-$(cat api_key.txt 2>/dev/null)}
-    R=$(curl -s http://127.0.0.1:$PORT/v1/chat/completions -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+    R=$(curl -s $SRV/v1/chat/completions -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
         -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Hvad er hovedstaden i Danmark? Svar med ét ord."}],"max_tokens":8,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}')
     echo "$R" | grep -qi "københavn\|copenhagen" && ok "chat completion answers ('$(echo "$R" | $PY -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null)')" || fail "chat completion wrong/failed: $(echo "$R" | head -c 200)"
+    # A text answer can pass with a broken/disabled vision tower. Require two
+    # Image-dependent answers when Vision is requested; expected color order lives only in pixels.
+    if [ "${VISION:-0}" = 1 ]; then
+      if VLLM_API="$SRV" OPENAI_API_KEY="$KEY" "$PY" bench/vision_smoke.py; then
+        ok "Vision reads two different image color orders"
+      else
+        fail "Vision image round-trip failed (see above)"
+      fi
+    fi
     # /tokenize contract — the endpoint exists to prove the client's and the
     # server's tokenizers agree, and nothing asserted it. These rows catch
     # gotcha 32 (an empty-vocab dir encodes everything to []) and chat-template
     # drift at the HTTP boundary the bench client's alignment probe uses.
     #
-    # The 404-names / keyless-401 / /v1 rows describe behaviour three serving
-    # patches add, so they are graded against the installed tree instead of
-    # asserted unconditionally: FAIL once the patch is in $SP (the contract is
+    # The keyless-401 and /v1 rows describe behaviour two serving patches add,
+    # so they are graded against the installed tree instead of asserted
+    # unconditionally (the 404-names row is vLLM's own from 0.32.0, vllm
+    # #59889, so it is asserted): FAIL once the patch is in $SP (the contract is
     # real and the server breaks it), WARN while it is not (nothing is wrong
     # with this install — the image predates the patch). Without the gate every
     # live box reads red between merging the patches and rebuilding the image,
@@ -434,11 +481,11 @@ text = tok.apply_chat_template(
 print(",".join(map(str, tok.encode(text, add_special_tokens=False))))
 EOF
 )
-    TOK_S=$(ids_of "http://127.0.0.1:$PORT/tokenize" "{\"model\":\"qwen3.8-27b\",\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
+    TOK_S=$(ids_of "$SRV/tokenize" "{\"model\":\"qwen3.8-27b\",\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
     [ -n "$TOK_LOC" ] && [ "$TOK_S" = "$TOK_LOC" ] \
       && ok "/tokenize with the served id returns the checkpoint tokenizer's ids" \
       || fail "/tokenize disagrees with the checkpoint tokenizer (server='$TOK_S' local='$TOK_LOC')"
-    TOK_S=$(ids_of "http://127.0.0.1:$PORT/tokenize" "{\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
+    TOK_S=$(ids_of "$SRV/tokenize" "{\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
     [ -n "$TOK_S" ] && [ "$TOK_S" = "$TOK_LOC" ] \
       && ok "/tokenize with the model omitted returns the same ids" \
       || fail "/tokenize model-omitted disagrees ('$TOK_S' vs '$TOK_LOC')"
@@ -449,7 +496,7 @@ EOF
     # template rejected the request" is a different finding from "the two
     # tokenizers disagree", and only the second one should stop a boot — so the
     # first warns with the body instead of failing.
-    TOK_R=$(curl -s -w '\n%{http_code}' "http://127.0.0.1:$PORT/tokenize" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+    TOK_R=$(curl -s -w '\n%{http_code}' "$SRV/tokenize" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
       -d "{\"model\":\"qwen3.8-27b\",\"messages\":[{\"role\":\"user\",\"content\":\"$TOKP\"}],\"chat_template_kwargs\":{\"enable_thinking\":false}}")
     TOK_CODE=${TOK_R##*$'\n'}; TOK_BODY=${TOK_R%$'\n'*}
     TOK_S=$(printf '%s' "$TOK_BODY" | $PY -c 'import json,sys
@@ -463,20 +510,19 @@ print(",".join(map(str, json.load(sys.stdin).get("tokens", ()))))' 2>/dev/null)
     else
       fail "/tokenize chat form disagrees (server='$TOK_S' template='$TOK_CHAT_LOC')"
     fi
-    TOK_R=$(curl -s -w '\n%{http_code}' "http://127.0.0.1:$PORT/tokenize" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{"model":"not-a-served-model","prompt":"x"}')
+    TOK_R=$(curl -s -w '\n%{http_code}' "$SRV/tokenize" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{"model":"not-a-served-model","prompt":"x"}')
     TOK_CODE=${TOK_R##*$'\n'}; TOK_BODY=${TOK_R%$'\n'*}
-    [ "$TOK_CODE" = 404 ] && printf '%s' "$TOK_BODY" | grep -q "Served models" \
+    [ "$TOK_CODE" = 404 ] && printf '%s' "$TOK_BODY" | grep -q "Valid aliases" \
       && ok "unknown model name -> 404 whose body lists the served names" \
-      || graded serve-404-served-names entrypoints/serve/engine/serving.py "Served models:" \
-           "unknown model name -> $TOK_CODE, body lists nothing usable: $(printf '%s' "$TOK_BODY" | head -c 120)"
+      || fail "unknown model name -> $TOK_CODE, body lists nothing usable: $(printf '%s' "$TOK_BODY" | head -c 120)"
     if [ -n "$KEY" ]; then
-      TOK_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/tokenize" -H "Content-Type: application/json" -d "{\"model\":\"qwen3.8-27b\",\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
+      TOK_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$SRV/tokenize" -H "Content-Type: application/json" -d "{\"model\":\"qwen3.8-27b\",\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
       [ "$TOK_CODE" = 401 ] \
         && ok "keyless /tokenize -> 401" \
         || graded auth-deny-default entrypoints/serve/middleware/authenticate.py "UNGUARDED_PATHS" \
              "keyless /tokenize -> $TOK_CODE (expected 401: it renders arbitrary text through the chat template)"
     else warn "no API key configured — the keyless-401 row cannot run"; fi
-    TOK_S=$(ids_of "http://127.0.0.1:$PORT/v1/tokenize" "{\"model\":\"qwen3.8-27b\",\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
+    TOK_S=$(ids_of "$SRV/v1/tokenize" "{\"model\":\"qwen3.8-27b\",\"prompt\":\"$TOKP\",\"add_special_tokens\":false}")
     [ -n "$TOK_S" ] && [ "$TOK_S" = "$TOK_LOC" ] \
       && ok "/v1/tokenize answers with the same ids (OpenAI-SDK base_url .../v1)" \
       || graded tokenize-v1-route entrypoints/serve/tokenize/api_router.py 'prefix="/v1"' \
@@ -489,7 +535,9 @@ print(",".join(map(str, json.load(sys.stdin).get("tokens", ()))))' 2>/dev/null)
       grep -q "MarlinLinearKernel" "$LOG" && ok "Marlin kernels in use" || true
       grep -oE "capping max_num_seqs [0-9]+ -> [0-9]+" "$LOG" | tail -1 | sed 's/^/  INFO  KVarN /'
     fi
-  else warn "no server on :$PORT (start batch/start_qwen.sh or single-user/start_qwen.sh, or pass --no-server)"; fi
+  elif [ -f /.dockerenv ] && [ -z "${VERIFY_SERVER_URL:-}" ]; then
+    warn "live checks SKIPPED: no server at $SRV from inside this container. A 'docker compose run' container is not the server's: run 'make verify' while the service is up (it runs verify.sh inside it), or set VERIFY_SERVER_URL=http://single:$PORT (or batch)"
+  else warn "no server at $SRV (start batch/start_qwen.sh or single-user/start_qwen.sh, set VERIFY_SERVER_URL, or pass --no-server)"; fi
 fi
 echo
 [ $FAILS = 0 ] && echo "verify: OK ($FAILS failures)" || echo "verify: $FAILS FAILURE(S)"

@@ -18,13 +18,13 @@ is the same text followed by vLLM source (varied, so a suffix lookup gets no fre
 from a repeated section) and its first 244,038 characters are byte-identical, which keeps
 every number taken at --ctx 20000 comparable.
 """
-import glob
 import json
 import os
 import sys
 import time
 
 import harness
+from labd_corpus import load_corpus
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
@@ -38,15 +38,7 @@ CTX = int(arg("--ctx", 20000))
 MAXTOK = int(arg("--max-tokens", 512))
 
 
-if not os.path.exists(CORPUS):
-    docs = [open(f).read() for f in sorted(glob.glob(os.path.expanduser("~/qwen-serving/*.md")) +
-                                           glob.glob(os.path.expanduser("~/qwen-serving/*/README.md")))]
-    text = "\n\n".join(docs)
-    while len(text) < 200000:
-        text += "\n\n" + "\n\n".join(docs)
-    os.makedirs(os.path.dirname(CORPUS), exist_ok=True)
-    open(CORPUS, "w").write(text)
-_full = open(CORPUS).read()
+_full = load_corpus(CORPUS)
 _want = int(CTX * 3.6)
 if len(_full) < _want:
     print(f"WARNING: {CORPUS} is {len(_full)} chars, --ctx {CTX} wants {_want}; "
@@ -82,7 +74,7 @@ for name, q in TASKS:
                "stream_options": {"include_usage": True},
                "chat_template_kwargs": {"enable_thinking": False}}
     d0, a0 = harness.spec()
-    t0 = time.time()
+    t0 = time.perf_counter()
     t_first = None
     n_chunks = 0
     usage = {}
@@ -92,9 +84,9 @@ for name, q in TASKS:
         for ch in ev.get("choices", []):
             if ch.get("delta", {}).get("content"):
                 if t_first is None:
-                    t_first = time.time()
+                    t_first = time.perf_counter()
                 n_chunks += 1
-    t_end = time.time()
+    t_end = time.perf_counter()
     d1, a1 = harness.spec()
     steps = d1 - d0
     tps = 1 + (a1 - a0) / max(steps, 1)

@@ -1,6 +1,6 @@
 """The pth-flash-attn op (pthfa/, PTH_FA=1) against an fp64 reference on the int8_per_token_head cache it reads.
 
-Three parts, all on the cache views the CUSTOM backend passes to the op (PthFlashAttnImpl._caches over a packed
+Four parts, all on the cache views the CUSTOM backend passes to the op (PthFlashAttnImpl._caches over a packed
 [blocks, ., ., 2 * (D + 4)] int8 cache, scales inline):
   1. shapes: head sizes 64/128/256, the target's GQA group at TP=1 (24 q / 4 kv) and TP=2 (12 / 2), decode,
      MTP verify (4 query tokens per request) and chunked prefill, both cache layouts, one and several KV splits,
@@ -12,6 +12,11 @@ Three parts, all on the cache views the CUSTOM backend passes to the op (PthFlas
      L = 20,000 / 131,072 against bench/test_spec_decode_bigpool.py's 0.05.
   3. CUDA-graph replay: a captured decode/verify launch, replayed after seq_lens grew on the device (as vLLM's
      FULL graphs replay), equals the eager launch bit for bit and the reference, with one and several splits.
+  4. the DFlash2 drafter's layers: D = 128, 16 / 4 heads (TP=2) and 32 / 8 (TP=1), sliding window 2048, non-causal,
+     8 query tokens per request (row r at position p sees keys [max(0, p - 2047), min(L - 1, p + 2047)]), block 864,
+     L around the window edge and past it, both layouts, one and several splits, bf16 and fp16; once with the
+     blocks below the window pointing to block 0 with NaN scales (vLLM's null block); and the window causal, and
+     non-causal without a window, once each. The same tolerance (the visible keys are at most 2,055).
 
 Run inside the image or a venv with pthfa/install.sh done (production stopped; ~6 GB of GPU memory):
   venv/bin/python bench/test_pthfa_attn.py
@@ -43,9 +48,9 @@ def report(ok, what):
     RESULTS.append(ok)
 
 
-def impl_for(hq, hkv, d):
+def impl_for(hq, hkv, d, window=0):
     return PthFlashAttnImpl(num_heads=hq, head_size=d, scale=d ** -0.5, num_kv_heads=hkv, alibi_slopes=None,
-                            sliding_window=None, kv_cache_dtype="int8_per_token_head")
+                            sliding_window=window or None, kv_cache_dtype="int8_per_token_head")
 
 
 def make_cache(impl, nb, bs, hkv, d, layout, fill=True):
@@ -60,16 +65,23 @@ def make_cache(impl, nb, bs, hkv, d, layout, fill=True):
     return k, v, ks, vs
 
 
-def reference(q, caches, bt, seq_lens, q_lens, scale):
-    """fp64 causal attention on the dequantized cache; returns (o, p @ |v|)."""
+def reference(q, caches, bt, seq_lens, q_lens, scale, window=0, causal=True):
+    """fp64 attention on the dequantized cache, causal or windowed / non-causal; returns (o, p @ |v|).
+
+    Row r at position p sees keys lo..hi: lo = max(0, p - W + 1) (0 without a window), hi = p if causal, else
+    min(L - 1, p + W - 1) (L - 1 without a window). Only keys from the first row's lo on are read, so blocks
+    wholly below the window (vLLM's null block) never enter it."""
     k, v, ks, vs = caches
     bs, hkv = k.shape[1], k.shape[2]
     g = q.shape[1] // hkv
     out = torch.empty(q.shape, dtype=torch.float64, device=DEV); absv = torch.empty_like(out)
     start = 0
     for r, (L, ql) in enumerate(zip(seq_lens, q_lens)):
-        slots = torch.arange(L, device=DEV); blocks = bt[r, slots // bs].long(); offs = slots % bs
-        vis = slots[None, :] <= (L - ql + torch.arange(ql, device=DEV))[:, None]
+        pos = L - ql + torch.arange(ql, device=DEV)
+        lo = (pos - window + 1).clamp(min=0) if window else torch.zeros_like(pos)
+        hi = pos if causal else ((pos + window - 1).clamp(max=L - 1) if window else torch.full_like(pos, L - 1))
+        slots = torch.arange(int(lo[0]), L, device=DEV); blocks = bt[r, slots // bs].long(); offs = slots % bs
+        vis = (slots[None, :] >= lo[:, None]) & (slots[None, :] <= hi[:, None])
         for h in range(hkv):  # one KV head at a time keeps a 131k-token reference in a few hundred MB
             kd = k[blocks, offs, h].double() * ks[blocks, offs, h].double()[:, None]   # [L, D]
             vd = v[blocks, offs, h].double() * vs[blocks, offs, h].double()[:, None]
@@ -81,36 +93,47 @@ def reference(q, caches, bt, seq_lens, q_lens, scale):
     return out, absv
 
 
-def launch(q, caches, bt, seq_lens_t, qsl, q_lens, scale, hkv, d, ws_ts, out=None):
+def launch(q, caches, bt, seq_lens_t, qsl, q_lens, scale, hkv, d, ws_ts, out=None, window=0, causal=True):
     g = q.shape[1] // hkv; qmax = max(q_lens)
     plan = plan_launch(num_tokens=q.shape[0], num_reqs=len(q_lens), max_query_len=qmax, G=g, Hkv=hkv, D=d,
-                       num_sms=NUM_SMS, is_prefill=qmax > 64 // g, ws_token_splits=ws_ts)
+                       num_sms=NUM_SMS, is_prefill=qmax > 64 // g, ws_token_splits=ws_ts, window=window)
     ws_o = torch.empty(plan.ws_o_shape, dtype=torch.float32, device=DEV)
     ws_lse = torch.empty(plan.ws_lse_shape, dtype=torch.float32, device=DEV)
     out = torch.full_like(q, float("nan")) if out is None else out
-    ops.pth_flash_attn_fwd(out, q, *caches, bt, seq_lens_t, qsl, qmax, plan.wm, plan.num_splits, scale, ws_o, ws_lse)
+    ops.pth_flash_attn_fwd(out, q, *caches, bt, seq_lens_t, qsl, qmax, plan.wm, plan.num_splits, scale, ws_o, ws_lse,
+                           window, causal)
     return out, plan
 
 
-def case(hq, hkv, d, seq_lens, q_lens, dtype, layout, bs, ws_ts):
-    impl = impl_for(hq, hkv, d)
+def case(hq, hkv, d, seq_lens, q_lens, dtype, layout, bs, ws_ts, window=0, causal=True, null_block=False):
+    impl = impl_for(hq, hkv, d, window)
     nbr = [math.ceil(L / bs) for L in seq_lens]
     nb = sum(nbr) + 1
     caches = make_cache(impl, nb, bs, hkv, d, layout)
-    perm = torch.randperm(nb, device=DEV, dtype=torch.int32)
+    if null_block:  # block 0 is vLLM's null block: NaN scales, and every block wholly below the window maps to it
+        caches[2][0] = float("nan"); caches[3][0] = float("nan")
+        perm = torch.randperm(nb - 1, device=DEV, dtype=torch.int32) + 1
+    else:
+        perm = torch.randperm(nb, device=DEV, dtype=torch.int32)
     bt = torch.zeros(len(seq_lens), max(nbr), dtype=torch.int32, device=DEV); used = 0
+    nulled = 0
     for r, n in enumerate(nbr):
         bt[r, :n] = perm[used:used + n]; used += n
+        if null_block:
+            below = max(0, seq_lens[r] - q_lens[r] - window + 1) // bs  # blocks wholly below the first row's lo
+            bt[r, :below] = 0; nulled += below
     q = torch.randn(sum(q_lens), hq, d, dtype=dtype, device=DEV)
     qsl = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32, device=DEV)
     sl = torch.tensor(seq_lens, dtype=torch.int32, device=DEV)
-    out, plan = launch(q, caches, bt, sl, qsl, q_lens, impl.scale, hkv, d, ws_ts)
+    out, plan = launch(q, caches, bt, sl, qsl, q_lens, impl.scale, hkv, d, ws_ts, window=window, causal=causal)
     torch.cuda.synchronize()
-    ref, absv = reference(q, caches, bt, seq_lens, q_lens, impl.scale)
+    ref, absv = reference(q, caches, bt, seq_lens, q_lens, impl.scale, window, causal)
     tol = 2.0 ** -8 * absv + OUT_ROUNDING[dtype] * ref.abs() + 2.0 ** -24
     worst = ((out.double() - ref).abs() / tol).max().item()
-    ok = bool(torch.isfinite(out).all()) and worst <= 1.0
-    report(ok, f"D={d} Hq/Hkv={hq}/{hkv} q_lens={q_lens} L={seq_lens} {str(dtype)[6:]} {layout} bs={bs} "
+    ok = bool(torch.isfinite(out).all()) and worst <= 1.0 and (nulled > 0 or not null_block)
+    mask = f" W={window} {'causal' if causal else 'non-causal'}" if window or not causal else ""
+    mask += f" null-block x{nulled}" if null_block else ""
+    report(ok, f"D={d} Hq/Hkv={hq}/{hkv} q_lens={q_lens} L={seq_lens} {str(dtype)[6:]} {layout} bs={bs}{mask} "
                f"splits={plan.num_splits}: max err/tol {worst:.3f}")
 
 
@@ -194,5 +217,20 @@ for ws in (0, 1 << 20):
     worst = ((out_g.double() - ref).abs() / tol).max().item()
     report(same and worst <= 1.0, f"splits={plan.num_splits}: L 100/200 -> 1500/4096 on the device; replay == eager "
                                   f"bit for bit: {same}; vs reference max err/tol {worst:.3f}")
+
+print("== 4. the DFlash2 drafter's layers: D=128, sliding window 2048, non-causal, 8 query tokens", flush=True)
+W, DRAFT_Q, DRAFT_BS = 2048, 8, 864
+DRAFT_L = [8, 2047, 2048, 2049, 2055, 5000]  # one block, the window edge, past it
+for hq, hkv in ((16, 4), (32, 8)):
+    for layout in ("NHD", "HND"):
+        for ws in (0, 1 << 20):  # ws 0 forces one split
+            case(hq, hkv, 128, DRAFT_L, [DRAFT_Q] * len(DRAFT_L), torch.bfloat16, layout, DRAFT_BS, ws,
+                 window=W, causal=False)
+    case(hq, hkv, 128, DRAFT_L, [DRAFT_Q] * len(DRAFT_L), torch.float16, "NHD", DRAFT_BS, 1 << 20,
+         window=W, causal=False)
+    case(hq, hkv, 128, [5000, 9000], [DRAFT_Q] * 2, torch.bfloat16, "NHD", DRAFT_BS, 1 << 20,
+         window=W, causal=False, null_block=True)
+case(16, 4, 128, DRAFT_L, [DRAFT_Q] * len(DRAFT_L), torch.bfloat16, "NHD", DRAFT_BS, 1 << 20, window=W, causal=True)
+case(16, 4, 128, [8, 3000], [DRAFT_Q] * 2, torch.bfloat16, "NHD", DRAFT_BS, 1 << 20, window=0, causal=False)
 ok = all(RESULTS)
 print(f"PTHFA ATTN {'OK' if ok else 'FAIL'} ({sum(RESULTS)}/{len(RESULTS)})"); sys.exit(0 if ok else 1)

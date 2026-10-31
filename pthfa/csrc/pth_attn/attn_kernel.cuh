@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 noon-at-cgn
 //
-// attn_kernel.cuh: the tensor-core attention kernel (plan section 3; build
-// ladder steps 12-19; owner T4 = P0InfraCI in Phase 3).
+// attn_kernel.cuh: the tensor-core attention kernel.
 //
 // One CTA of 128 threads computes one (q-tile x, KV head, split): the
-// planner's grid (ADR 0016), the same as the scalar reference kernel
+// planner's grid, the same as the scalar reference kernel
 // (reference_kernel.cu, the executable specification it is tested against).
 // Every address, row tile, causal limit and split range comes from
 // cache_geometry.cuh; the KV tiles come from loader.cuh (separate streams,
-// two-stage cp.async pipeline, ADR 0006); the fragment loops from tiling.cuh;
+// two-stage cp.async pipeline); the fragment loops from tiling.cuh;
 // the online softmax and P'' from softmax.cuh; the mask from mask.cuh.
 //
 //   prologue   find the row tile; issue the first KV tile; stage Q into
 //              shared memory as fp16 with the per-row 2^-e prescale and the
-//              K permutation pi (ADR 0008, 0010); per-row score factor
+//              K permutation pi; per-row score factor
 //              c_row = fp32(softmax_scale * log2 e) * 2^e.
 //   main loop  per KV tile of this split: wait, barrier, issue the next tile
 //              into the other stage, then per sub-tile of SUB tokens of the
@@ -24,8 +23,8 @@
 //   merge      WN > 1: warps n > 0 park (O, m, l, c) in the freed stages and
 //              warp n = 0 merges them (emulate.py `_merge_warps` order).
 //   epilogue   o = fp32(O / l) * 2^C (rcp.approx); S = 1: out in its dtype,
-//              16-B stores of 8 contiguous d (ADR 0009); S > 1: the fp32
-//              partial and lse = m + lg2(l) (log2 units, ADR 0016); an empty
+//              16-B stores of 8 contiguous d; S > 1: the fp32
+//              partial and lse = m + lg2(l) (log2 units); an empty
 //              row writes o = 0, lse = -inf.
 //
 // The arithmetic is python/pth_testing/emulate.py's, which the bound of
@@ -54,16 +53,20 @@
 namespace pth_attn {
 
 // Everything a launch needs: the frozen KernelParams plus the output dtype
-// (a runtime switch: it only touches the epilogue) and, for the whole-cell
-// loader, its cp.async width (loader.cuh cell_layout_width: 8 or 4).
+// (a runtime switch: it only touches the epilogue), for the whole-cell
+// loader its cp.async width (loader.cuh cell_layout_width: 8 or 4), and the
+// window of the windowed kernels (appended last, so every other
+// field keeps its parameter offset in the causal kernels).
 struct AttnParams {
   KernelParams k;
   int32_t out_dtype;   // PTH_ATTN_F32 / PTH_ATTN_F16 / PTH_ATTN_BF16
   int32_t cell_width;  // whole-cell instantiations only
+  int32_t window;      // windowed instantiations only: 0 = none
+  int32_t causal;      // windowed instantiations only: 1 causal, 0 not
 };
 
-// Shared memory of one instantiation: Q (T3's layout), two stages in the
-// loader's layout (separate streams: StageLayout; whole cell:
+// Shared memory of one instantiation: Q (laid out by smem_layout.cuh), two
+// stages in the loader's layout (separate streams: StageLayout; whole cell:
 // CellStageLayout), and the per-row score factors (one f32 per CTA row).
 // The factors get their own region at 1 CTA per SM (there is room, and the
 // producer warps may fill stage 1 early); with 2-3 CTAs per SM there is no
@@ -176,7 +179,7 @@ __device__ __forceinline__ void stage_q(const KernelParams& p,
   #pragma unroll
     for (int i = 0; i < kPairsPerLane; ++i) {
       const int d = 2 * (lane + i * kWarpSize);
-      // pi inside each 16-element chunk, then the Q swizzle (ADR 0007/0008);
+      // pi inside each 16-element chunk, then the Q swizzle;
       // d and d + 1 land in adjacent bytes, so the pair is one STS.32.
       *reinterpret_cast<uint32_t*>(smem_q + q_elem_offset(r, d, D)) =
           q_prescale_pack(v[i].x, v[i].y, e);
@@ -185,7 +188,7 @@ __device__ __forceinline__ void stage_q(const KernelParams& p,
   }
 }
 
-// Producer warps (ADR 0012 Amendment 1): at 1 CTA per SM (D = 256) four
+// Producer warps: at 1 CTA per SM (D = 256) four
 // extra warps only issue the KV copies, so the issue (throttled to the copy
 // rate) overlaps the math of the four compute warps. With 2-3 CTAs per SM
 // (D = 128, 64) the other CTAs provide that overlap, and 256 threads would
@@ -226,7 +229,7 @@ __device__ __forceinline__ void consumer_sync() {
 
 // Global loads that do not allocate in L1 (PTX ISA 9.7.9.8,
 // ld.global.L1::no_allocate): the KV stream is read once, and L1 shares its
-// SRAM with the shared-memory stages (ADR 0012 Amendment 1). 16 B for the
+// SRAM with the shared-memory stages. 16 B for the
 // aligned body of a cell, 8 B for its edge (produce_cells_regstaged).
 struct NoAllocLoad16 {
   __device__ static uint4 load(const char* g) {
@@ -252,8 +255,7 @@ struct NoAllocLoad8 {
 // map, CellStageLayout pitch 2D + 16) through registers: loads that skip L1,
 // then shared stores once the stage is free. Tokens at or past the range end
 // are zero-filled (as the cp.async loader's zfill). Measured against cp.async
-// of the same bytes in ADR 0012 Amendment 1, and 8-B against 16-B loads in
-// Amendment 2.
+// of the same bytes, and 8-B against 16-B loads.
 //
 // An 8-B aligned cell of 2D + 8 bytes is one 8-B edge plus 2D bytes of 16-B
 // aligned body. The edge is the cell's last 8 bytes if the cell
@@ -322,27 +324,32 @@ __device__ __forceinline__ void produce_cells_regstaged(
 }
 
 // One loader warp's share of copying KV tile `tile` into `stage`
-// (loader.cuh; loader warp lw owns tokens 16 lw .. 16 lw + 15).
-template <int D, bool kCell, class Sm>
+// (loader.cuh; loader warp lw owns tokens 16 lw .. 16 lw + 15). kLower (the
+// windowed kernels) also zero-fills the tokens below kv_begin.
+template <int D, bool kCell, class Sm, bool kLower = false>
 __device__ __forceinline__ void issue_tile_to(const AttnParams& ap,
                                               const RowTile& rt, int32_t kvh,
                                               int32_t kv_end,
                                               uint32_t smem_base, int32_t tile,
-                                              int stage, int lw, int lane) {
+                                              int stage, int lw, int lane,
+                                              int32_t kv_begin = 0) {
+  static_assert(!(kCell && kLower), "the whole-cell loader has no lower bound");
   const KernelParams& p = ap.k;
-  const LaneRows mine = resolve_lane(p, rt.req, kvh, tile, kv_end, lw, lane);
+  const LaneRows mine =
+      resolve_lane<kLower>(p, rt.req, kvh, tile, kv_end, lw, lane, kv_begin);
   const DeviceCopy copy{smem_base +
                         static_cast<uint32_t>(Sm::stage_offset(stage))};
   if constexpr (kCell) {
     issue_tile_cell_lane<D>(p, mine, ap.cell_width, tile, kv_end, lw, lane,
                             DeviceBcast{}, copy);
   } else {
-    issue_tile_separate_lane<D>(p, mine, tile, kv_end, lw, lane, DeviceBcast{},
-                                DeviceBcast{}, copy);
+    issue_tile_separate_lane<D, kLower>(p, mine, tile, kv_end, lw, lane,
+                                        DeviceBcast{}, DeviceBcast{}, copy,
+                                        kv_begin);
   }
 }
 
-// Producer warp `pw` (0..3) of a warp-specialised CTA (ADR 0012 Amendment 1):
+// Producer warp `pw` (0..3) of a warp-specialised CTA:
 // it only copies, so the copy overlaps the consumers' math. Two stages; tile
 // j may be written as soon as tile j - 2 has been released by the consumers.
 // Shared by the 16-row-tile kernel (attn_fwd_body) and the decode kernel
@@ -389,8 +396,14 @@ __device__ __forceinline__ void run_producer_warp(
   }
 }
 
-template <int D, int WM, int SUB, typename QT, bool kCell>
+// kWindow: the sliding-window / non-causal variant. false
+// compiles to the causal kernel exactly (every window branch is
+// `if constexpr`); true exists only where it is instantiated
+// (attn_fwd_window_kernel: D = 128, separate streams).
+template <int D, int WM, int SUB, typename QT, bool kCell, bool kWindow = false>
 __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
+  static_assert(!kWindow || (!kCell && kAttnProducerWarps<D> == 0),
+                "windowed kernels: separate streams, no producer warps");
   using TT = AttnGeometry<D, WM, SUB>;
   using Sm = AttnSmem<D, WM, SUB, kCell>;
   using R = typename Sm::R;
@@ -408,17 +421,33 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
                 static_cast<int32_t>(blockIdx.x), rt)) {
     return;  // surplus q-tile of the padded grid
   }
-  const int32_t kv_end = kv_range_end(rt);
-  const int32_t min_limit = kv_min_limit(rt);
+  // The CTA's KV range [kv_begin, kv_end) and its split's tiles [tb, te):
+  // bottom-right causal, or the sliding / non-causal window, whose first
+  // tile may start below kv_begin (the loader zero-fills those tokens).
+  // min_limit is the smallest row limit (hi); max_lo the largest row lo.
+  int32_t kv_begin = 0, kv_end = 0, min_limit = 0;
+  [[maybe_unused]] int32_t max_lo = 0;
   int32_t tb = 0, te = 0;
-  split_tile_range(split, p.num_splits, num_kv_tiles(kv_end, kLoadTileTokens),
-                   tb, te);
+  if constexpr (kWindow) {
+    const bool causal = ap.causal != 0;
+    kv_begin = kv_window_range_begin(rt, ap.window);
+    kv_end = kv_window_range_end(rt, ap.window, causal);
+    min_limit = kv_window_min_hi(rt, ap.window, causal);
+    max_lo = kv_window_max_lo(rt, ap.window);
+    window_split_tile_range(split, p.num_splits, kv_begin, kv_end,
+                            kLoadTileTokens, tb, te);
+  } else {
+    kv_end = kv_range_end(rt);
+    min_limit = kv_min_limit(rt);
+    split_tile_range(split, p.num_splits, num_kv_tiles(kv_end, kLoadTileTokens),
+                     tb, te);
+  }
 
   const uint32_t smem_base = smem_u32(smem);
   constexpr int kProducers = kAttnProducerWarps<D>;
   auto issue_tile = [&](int32_t tile, int stage, int lw) {
-    issue_tile_to<D, kCell, Sm>(ap, rt, kvh, kv_end, smem_base, tile, stage, lw,
-                                lane);
+    issue_tile_to<D, kCell, Sm, kWindow>(ap, rt, kvh, kv_end, smem_base, tile,
+                                         stage, lw, lane, kv_begin);
   };
 
   if constexpr (kProducers > 0) {
@@ -440,16 +469,28 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
 
   const int g = frag_g(lane), q = frag_q(lane);
   float row_scale[2];
-  int32_t limit[2];
+  int32_t limit[2];                // the row's last visible position (its hi)
+  [[maybe_unused]] int32_t lo[2];  // the row's first visible position (kWindow)
   #pragma unroll
   for (int h = 0; h < 2; ++h) {
     const int r = warp_m * kMmaM + g + 8 * h;
     row_scale[h] = row_factor[r];
     int32_t tok = 0, hh = 0;
-    limit[h] = row_to_token_head(static_cast<uint32_t>(r), p.group, rt.num_tok,
-                                 tok, hh)
-                   ? kv_limit(rt.q_len, rt.seq_len, rt.tok_begin + tok)
-                   : -1;
+    if constexpr (kWindow) {
+      // Padding rows see nothing: [0, -1].
+      const bool real = row_to_token_head(static_cast<uint32_t>(r), p.group,
+                                          rt.num_tok, tok, hh);
+      const int32_t i = rt.tok_begin + tok;
+      lo[h] = real ? kv_window_lo(rt.q_len, rt.seq_len, i, ap.window) : 0;
+      limit[h] = real ? kv_window_hi(rt.q_len, rt.seq_len, i, ap.window,
+                                     ap.causal != 0)
+                      : -1;
+    } else {
+      limit[h] = row_to_token_head(static_cast<uint32_t>(r), p.group,
+                                   rt.num_tok, tok, hh)
+                     ? kv_limit(rt.q_len, rt.seq_len, rt.tok_begin + tok)
+                     : -1;
+    }
   }
 
   WarpSoftmax<D> st;
@@ -487,7 +528,11 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
           s[n][2 * h + 1] = (s[n][2 * h + 1] * k2.y) * row_scale[h];
         }
       }
-      if (subtile_needs_mask(abs0, SUB, min_limit)) {
+      if constexpr (kWindow) {
+        if (subtile_needs_window_mask(abs0, SUB, max_lo, min_limit)) {
+          apply_window_mask<SUB>(s, abs0, lo, limit, lane);
+        }
+      } else if (subtile_needs_mask(abs0, SUB, min_limit)) {
         apply_causal_mask<SUB>(s, abs0, limit, lane);
       }
       uint32_t pa[kNt][2];
@@ -578,7 +623,7 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
     }
   }
 
-  // ---- epilogue: 8 contiguous d per group a and row (ADR 0009) ----
+  // ---- epilogue: 8 contiguous d per group a and row ----
   const float c_unit = pow2_clamped(big_c);
   #pragma unroll
   for (int h = 0; h < 2; ++h) {
@@ -624,11 +669,19 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
 
 // __grid_constant__ keeps the parameters in the constant bank (no local copy
 // when a member's address is taken). __launch_bounds__(threads, CTAs/SM)
-// keeps ptxas within the occupancy register budget (ADR 0012).
+// keeps ptxas within the occupancy register budget.
 template <int D, int WM, int SUB, typename QT, bool kCell>
 __global__ void __launch_bounds__(kAttnThreads<D>, ctas_per_sm(D))
     attn_fwd_kernel(const __grid_constant__ AttnParams ap) {
   attn_fwd_body<D, WM, SUB, QT, kCell>(ap);
+}
+
+// The windowed kernels: a separate name, so the causal kernels above keep
+// their symbols and their machine code is unchanged by this variant.
+template <int D, int WM, int SUB, typename QT>
+__global__ void __launch_bounds__(kAttnThreads<D>, ctas_per_sm(D))
+    attn_fwd_window_kernel(const __grid_constant__ AttnParams ap) {
+  attn_fwd_body<D, WM, SUB, QT, false, true>(ap);
 }
 
 // ---------------------------------------------------------------------------
@@ -643,14 +696,22 @@ struct AttnLaunch {
   int32_t rows;     // bq * G: the decode kernel's n-tiles are ceil(rows / 8)
   int32_t q_dtype;  // PTH_ATTN_F16 or PTH_ATTN_BF16
   bool cell;        // whole-cell loader (ap.cell_width set) or separate streams
+  bool windowed;    // ap.window > 0 or !ap.causal: the windowed kernels
 };
 
 // The whole-cell loader exists where it fits next to the kernel's
 // occupancy: D = 256 (1 CTA per SM). At D = 128 its pitch-272 stages break
 // 2 CTAs per SM (2 x (16384 + 34816 + 1024) > 102400); D = 64 would fit but
-// has 3 CTAs per SM to overlap copies already (ADR 0012 Amendment 1).
+// has 3 CTAs per SM to overlap copies already.
 template <int D>
 inline constexpr bool kAttnHasCell = D == 256;
+
+// The windowed kernels exist at D = 128 only, the head size of the DFlash2
+// drafter's sliding-window layers. A windowed D = 256 layer would need a
+// window variant of the decode kernel (attn_decode.cuh); the launcher
+// refuses window > 0 or non-causal at D = 64 and 256.
+template <int D>
+inline constexpr bool kAttnHasWindow = D == 128;
 
 // Launches `kKernel` with kSmemBytes of dynamic shared memory and
 // kBlockThreads threads per block. Above 48 KB the limit must be raised once
@@ -675,10 +736,27 @@ cudaError_t launch_attn_one(const AttnLaunch& L, cudaStream_t stream) {
                           kAttnThreads<D>>(L.grid, stream, L.ap);
 }
 
-// Picks the q dtype and the loader of one (D, WM) instantiation.
+template <int D, int WM, typename QT>
+cudaError_t launch_attn_window_one(const AttnLaunch& L, cudaStream_t stream) {
+  constexpr int kSub = default_sub<D, WM>();
+  return launch_with_smem<attn_fwd_window_kernel<D, WM, kSub, QT>,
+                          AttnSmem<D, WM, kSub, false>::kBytes,
+                          kAttnThreads<D>>(L.grid, stream, L.ap);
+}
+
+// Picks the q dtype and the loader (or the windowed kernel) of one (D, WM)
+// instantiation.
 template <int D, int WM>
 cudaError_t launch_attn_wm(const AttnLaunch& L, cudaStream_t stream) {
   const bool bf16 = L.q_dtype == PTH_ATTN_BF16;
+  if (L.windowed) {
+    if constexpr (kAttnHasWindow<D>) {
+      if (L.cell) return cudaErrorInvalidValue;
+      return bf16 ? launch_attn_window_one<D, WM, __nv_bfloat16>(L, stream)
+                  : launch_attn_window_one<D, WM, __half>(L, stream);
+    }
+    return cudaErrorInvalidValue;
+  }
   if constexpr (kAttnHasCell<D>) {
     if (L.cell) {
       return bf16 ? launch_attn_one<D, WM, __nv_bfloat16, true>(L, stream)

@@ -33,7 +33,7 @@ What to look for, in order of how much a failure means:
 
 All four requests share one document, so this also exercises several requests resuming from
 the same cached prefix at once -- which is a likelier source of trouble than the lookup, and
-worth ruling in or out with PREFIX_CACHE=0 before blaming the drafter.
+worth ruling in or out with PREFIX_CACHE=0 (caching off) before blaming the drafter.
 """
 
 import os
@@ -42,6 +42,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import harness
+from labd_corpus import load_corpus
 
 CORPUS = os.path.expanduser("~/bench/labd_corpus.txt")
 
@@ -56,7 +57,7 @@ MAXTOK = arg("--max-tokens", 256)
 CTX = arg("--ctx", 20000)
 MINUTES = arg("--minutes", 0.0)
 
-doc = open(CORPUS).read()[: int(CTX * 3.6)]
+doc = load_corpus(CORPUS)[: int(CTX * 3.6)]
 TASKS = [
     ("copy", "Gengiv ordret de første 60 linjer af dokumentet. Ingen kommentarer, kun teksten."),
     ("summary", "Skriv en grundig, struktureret opsummering på dansk."),
@@ -70,9 +71,9 @@ def ask(task):
     payload = {"messages": [{"role": "user", "content": "Dokument:\n\n" + doc + "\n\n" + q}],
                "max_tokens": MAXTOK, "temperature": 0,
                "chat_template_kwargs": {"enable_thinking": False}}
-    t0 = time.time()
+    t0 = time.perf_counter()
     r = harness.post("/v1/chat/completions", payload, timeout=1800)
-    return {"task": name, "wall": time.time() - t0,
+    return {"task": name, "wall": time.perf_counter() - t0,
             "tokens": r["usage"]["completion_tokens"],
             "text": r["choices"][0]["message"]["content"]}
 
@@ -85,9 +86,9 @@ bad = 0
 soft = 0
 first_round_copy = None
 d0, a0 = harness.spec()
-t_end = time.time() + MINUTES * 60
+t_end = time.perf_counter() + MINUTES * 60
 rnd = 0
-while rnd < ROUNDS or time.time() < t_end:
+while rnd < ROUNDS or time.perf_counter() < t_end:
     rnd += 1
     batch = [TASKS[i % len(TASKS)] for i in range(CONC)]
     with ThreadPoolExecutor(CONC) as ex:

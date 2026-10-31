@@ -6,8 +6,9 @@
 // kernel at WM = 4 for the rest (33..64 rows), each x q dtype in {bf16, fp16}
 // with its shipped SUB (tile_traits.cuh Traits). WM = 1 and 2 cover at most
 // 16 and 32 rows, which the decode kernel always takes, so they have no
-// 16-row-tile instantiation here. One translation unit per D
-// (attn_kernel.cuh).
+// 16-row-tile instantiation here. No windowed kernel at D = 256 (the
+// launcher refuses window > 0 or non-causal there). One translation unit
+// per D (attn_kernel.cuh).
 
 #include "attn_decode.cuh"
 

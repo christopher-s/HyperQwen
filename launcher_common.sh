@@ -33,7 +33,19 @@
 #                       as os.environ.get(X) == "1", so "true", "yes" or "2" silently mean
 #                       off, and for a knob that defaults to on they turn it off (#310).
 #                       QWEN_BOOL_KNOBS lists them; bench/test_bool_knobs.sh checks that the
-#                       list matches what the patches register.
+#                       list matches what the patches register, plus FA2_FP8KV, which the
+#                       fa2/ plugin reads (not a patch). The launcher controls VISION and
+#                       VISION_OFFLOAD, LOOKUP, INT4_MQ_3D, TOOLS and EMBED_UVA are validated alongside it.
+#
+#   qwen_fa2_fp8kv_single_only  <launcher>, for the launchers that have no FA2 arm (batch,
+#                       alternative.sh). Refuses FA2_FP8KV=1: the variable is also the plugin's
+#                       gate (fa2/), and it would reach the server's environment from a shared .env.
+#
+#   qwen_vision_args     sets VISION_ARGS for every launcher: language-model-only by default,
+#                       or one image and a 2048-image-token pixel cap with VISION=1. EXTRA_ARGS
+#                       can override the limits. The tower's weights are offloaded to host RAM
+#                       by default (gotcha 8); VISION_OFFLOAD=0 disables that even when a budget
+#                       was inherited through VLLM_VISION_CPU_OFFLOAD_GB.
 #
 #   qwen_kv_offload_args  KV_OFFLOAD_GB=N becomes --kv-offloading-size N at the front of
 #                       EXTRA_ARGS: a CPU tier of N GiB of pinned RAM behind the GPU
@@ -41,14 +53,41 @@
 #                       back by a PCIe load instead of a recomputed prefill, and a
 #                       preempted request resumes from it. An explicit
 #                       --kv-offloading-size or --kv-transfer-config in EXTRA_ARGS wins.
-#                       Called before anything reads EXTRA_ARGS, so the allocator and
-#                       retention defaults the launchers pick for a tier see this one.
+#                       Called right after qwen_normalize_extra_args, before anything else
+#                       reads EXTRA_ARGS, so the allocator and retention defaults the
+#                       launchers pick for a tier see this one.
+#
+#   qwen_prefix_cache   right after qwen_kv_offload_args. PREFIX_CACHE=1 (unset or empty means
+#                       1) puts --enable-prefix-caching --mamba-cache-mode align at the front of
+#                       EXTRA_ARGS, 0 puts --no-enable-prefix-caching, anything else refuses
+#                       to boot. Both states are passed explicitly because vLLM's own default
+#                       moved at 0.28 (on for this hybrid model, off before), and the knob
+#                       must not mean something different on each pin. The last of the two
+#                       flags in EXTRA_ARGS wins, in vLLM and here (either spelling: vLLM reads
+#                       _ as - in flag names): PREFIX_CACHE_ON (0|1) is the state the engine
+#                       gets, and every caching-dependent default in the launchers reads it,
+#                       never PREFIX_CACHE. The state line goes to stderr, so PRINT_ARGV=1
+#                       stdout is the argv alone.
 #
 #   qwen_kv_offload_shm_check  after the stale-region sweep. vLLM backs the tier with a
 #                       file in /dev/shm (vllm_offload_<engine_id>.mmap) and pins all of
 #                       it at boot, so a tmpfs with less room than the tier fails the
 #                       boot. Warns, does not refuse: df cannot see a per-user tmpfs
 #                       quota, which is the other limit (docs/gotchas.md).
+#
+#   qwen_normalize_extra_args  first, before anything reads EXTRA_ARGS. Rewrites EXTRA_ARGS
+#                       into the words vLLM parses: whitespace runs become one space, and
+#                       every --flag name has _ turned into - up to its = or first dot,
+#                       as vLLM's FlexibleArgumentParser does. vLLM gets the same flags
+#                       either way. The launchers' own checks on EXTRA_ARGS (shadowed
+#                       flags, KV connector, all-reduce opt-out, TP size) match the dashed
+#                       names only, so without it --kv_offloading_size or
+#                       --disable_custom_all_reduce went unseen.
+#
+#   qwen_tp_size        prints the tensor-parallel size vLLM reads from EXTRA_ARGS, 1 when
+#                       there is none: the last -tp or --tensor-parallel-size, with its value
+#                       after a space or =. The launchers act on it at TP>1 (the KV_MEM pin,
+#                       #40; the allocator default, #163).
 #
 #   qwen_exec           the launcher's last call, in place of exec. With PRINT_ARGV=1 it
 #                       prints the argv, one argument per line, and exits 0 instead
@@ -98,11 +137,12 @@ QWEN_BOOL_KNOBS="KVARN_DBG_LAYERS KVARN_FAST_FLUSH KVARN_FP16_DEQUANT KVARN_FUSE
   VLLM_DFLASH2_CHAIN VLLM_DFLASH2_CHAIN_GREEDY_ONLY VLLM_DFLASH2_DRAFT_TOPK_TOPP \
   VLLM_DFLASH2_GRAPH_BOTH VLLM_DFLASH2_LOOKUP VLLM_DFLASH2_LOOKUP_ADAPTIVE VLLM_DRAFT_TOPK_TOPP \
   VLLM_EMBED_UVA VLLM_INT4_MQ_3D VLLM_INT4_MQ_3D_DEBUG VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS \
-  VLLM_MARLIN_TUNE VLLM_SPEC_ATTN_DEBUG VLLM_SPEC_DECODE_ATTN"
+  VLLM_MARLIN_TUNE VLLM_SPEC_ATTN_DEBUG VLLM_SPEC_DECODE_ATTN FA2_FP8KV"
 
 qwen_check_bool_knobs() {
   local k v bad=0
-  for k in $QWEN_BOOL_KNOBS; do
+  for k in $QWEN_BOOL_KNOBS VISION VISION_OFFLOAD LOOKUP LOOKUP_ADAPTIVE INT4_MQ_3D TOOLS EMBED_UVA \
+      SPEC_ATTN ASYNC_SCHED REQ_METRICS REQ_METRICS_DETAILED PRINT_ARGV; do
     v=${!k-}
     case "$v" in
       ""|0|1) ;;
@@ -110,6 +150,32 @@ qwen_check_bool_knobs() {
     esac
   done
   [ "$bad" = 0 ] || { echo "refusing to boot with a boolean knob that is neither 0 nor 1" >&2; exit 1; }
+}
+
+qwen_vision_args() {
+  # Keep --language-model-only explicit. Enable Vision with VISION=1, not by
+  # countering it with --no-language-model-only in EXTRA_ARGS: that accepts images
+  # and counts their tokens but silently answers from placeholder embeddings.
+  # vLLM profiles the encoder at the largest accepted image; that peak is deducted
+  # from the KV pool. The 2,097,152-pixel cap limits it to 2048 image tokens.
+  VISION_ARGS=(--language-model-only)
+  if [ "${VISION:-0}" = 1 ]; then
+    VISION_ARGS=(--limit-mm-per-prompt '{"image":{"count":1}}'
+                 --mm-processor-kwargs '{"size":{"shortest_edge":65536,"longest_edge":2097152}}')
+    if [ "${VISION_OFFLOAD:-1}" = 1 ]; then
+      export VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-1}
+    else
+      export VLLM_VISION_CPU_OFFLOAD_GB=0
+    fi
+  fi
+}
+
+# if, not &&: alternative.sh runs under set -e.
+qwen_fa2_fp8kv_single_only() {
+  if [ "${FA2_FP8KV:-0}" = 1 ]; then
+    echo "$1: refusing: FA2_FP8KV=1 runs only on single-user/start_qwen.sh SPEC=dflash2 CTX=long" >&2
+    exit 1
+  fi
 }
 
 qwen_kv_offload_args() {
@@ -120,6 +186,30 @@ qwen_kv_offload_args() {
       *) EXTRA_ARGS="--kv-offloading-size $KV_OFFLOAD_GB ${EXTRA_ARGS:-}" ;;
     esac
   fi
+}
+
+qwen_prefix_cache() {
+  local knob=${PREFIX_CACHE:-1} w words why
+  case "$knob" in
+    0|1) ;;
+    *) echo "PREFIX_CACHE=$knob: set 1 (prefix caching on, the default) or 0 (off)" >&2; exit 1 ;;
+  esac
+  PREFIX_CACHE_ON=$knob
+  read -r -d '' -a words <<< "${EXTRA_ARGS:-}" || :
+  for w in "${words[@]}"; do
+    case "$w" in
+      --enable[-_]prefix[-_]caching) PREFIX_CACHE_ON=1 ;;
+      --no[-_]enable[-_]prefix[-_]caching) PREFIX_CACHE_ON=0 ;;
+    esac
+  done
+  if [ "$PREFIX_CACHE_ON" = 1 ]; then
+    EXTRA_ARGS="--enable-prefix-caching --mamba-cache-mode align ${EXTRA_ARGS:-}"
+  else
+    EXTRA_ARGS="--no-enable-prefix-caching ${EXTRA_ARGS:-}"
+  fi
+  if [ -z "${PREFIX_CACHE:-}" ]; then why="PREFIX_CACHE unset, the default 1"; else why="PREFIX_CACHE=$knob"; fi
+  if [ "$PREFIX_CACHE_ON" != "$knob" ]; then why="EXTRA_ARGS overrides $why"; fi
+  if [ "$PREFIX_CACHE_ON" = 1 ]; then echo "prefix caching: on ($why)" >&2; else echo "prefix caching: off ($why)" >&2; fi
 }
 
 qwen_kv_offload_shm_check() {
@@ -133,4 +223,30 @@ qwen_kv_offload_shm_check() {
          "the boot will fail allocating it. Grow the tmpfs (fstab: tmpfs /dev/shm tmpfs" \
          "defaults,nosuid,nodev,size=<N>G 0 0, then mount -o remount /dev/shm) or lower the tier." >&2
   fi
+}
+
+qwen_normalize_extra_args() {
+  [ -n "${EXTRA_ARGS:-}" ] || return 0
+  local w head words out=()
+  read -r -d '' -a words <<< "$EXTRA_ARGS" || :
+  for w in "${words[@]}"; do
+    case $w in
+      --*) head=${w%%=*}; head=${head%%.*}; w=${head//_/-}${w#"$head"} ;;
+    esac
+    out+=("$w")
+  done
+  EXTRA_ARGS="${out[*]}"
+}
+
+qwen_tp_size() {
+  local w words prev= tp=1
+  read -r -d '' -a words <<< "${EXTRA_ARGS:-}" || :
+  for w in "${words[@]}"; do
+    case $prev in -tp|--tensor-parallel-size) tp=$w ;; esac
+    case $w in -tp=*|--tensor-parallel-size=*) tp=${w#*=} ;; esac
+    prev=$w
+  done
+  tp=${tp//[[:space:]]/}
+  case $tp in ""|*[!0-9]*) tp=1 ;; esac
+  echo "$tp"
 }

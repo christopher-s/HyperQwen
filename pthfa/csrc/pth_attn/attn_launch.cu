@@ -30,12 +30,11 @@ thread_local std::string g_last_error;
 
 // fp32(log2 e): scores in log2 units (as reference_kernel.cu kRefLog2e).
 constexpr float kLog2e = 1.44269504088896340736f;
-// q, out and the workspace move in 16-B vectors (OP_VECTOR_ALIGN_BYTES).
+// q, out and the workspace move in 16-B vectors.
 constexpr int64_t kVecAlign = 16;
 // Logical dims of a cache stream view with free strides: [NB, BS, Hkv].
 constexpr int32_t kStreamDims = 3;
-// The default loader takes the whole cell wherever it applies (ADR 0012
-// Amendment 1).
+// The default loader takes the whole cell wherever it applies.
 constexpr bool kDefaultCell = true;
 
 // Fills a stream's geometry and its cp.async width (the largest of 16/8/4
@@ -85,6 +84,13 @@ int32_t build(const PthAttnArgs& a, int32_t loader, AttnLaunch* L) {
   PTH_ATTN_REQUIRE(a.num_q_tiles >= 0, "num_q_tiles must be >= 0");
   PTH_ATTN_REQUIRE(std::isfinite(a.softmax_scale) && a.softmax_scale > 0.0f,
                    "softmax_scale must be finite and > 0");
+  PTH_ATTN_REQUIRE(a.window >= 0, "window must be >= 0 (0 = none)");
+  PTH_ATTN_REQUIRE(a.causal == 0 || a.causal == 1, "causal must be 0 or 1");
+  // The windowed kernels exist at D = 128 only.
+  const bool windowed = a.window > 0 || a.causal == 0;
+  PTH_ATTN_REQUIRE(!windowed || a.head_size == 128,
+                   "sliding-window and non-causal attention need head size "
+                   "D = 128");
   PTH_ATTN_REQUIRE(a.q && a.k_cache.data && a.v_cache.data && a.k_scale.data &&
                        a.v_scale.data && a.block_table && a.seq_lens &&
                        a.query_start_loc,
@@ -174,6 +180,9 @@ int32_t build(const PthAttnArgs& a, int32_t loader, AttnLaunch* L) {
       loader == pth_attn::kLoaderCell ||
       (loader == pth_attn::kLoaderDefault && kDefaultCell && cell_width > 0);
   L->ap.cell_width = cell_width;
+  L->ap.window = a.window;
+  L->ap.causal = a.causal;
+  L->windowed = windowed;
   L->wm = wm;
   L->rows = a.bq * group;
   L->q_dtype = a.q_dtype;

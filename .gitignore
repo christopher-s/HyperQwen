@@ -22,3 +22,7 @@ bench/results/
 bench-quality-data/
 bench-results/
 quantize.log
+# fa2/build.py run in place, instead of through fa2/install.sh
+fa2/build-*/
+fa2/third_party/
+fa2/python/**/*.so

@@ -81,7 +81,6 @@ Usage (on syv, against a server started with SPEC=dflash2):
 
 --model sets VLLM_MODEL (bench/harness.py); without it the server's first model answers.
 """
-import glob
 import hashlib
 import json
 import os
@@ -90,6 +89,7 @@ import sys
 import time
 
 import harness
+from labd_corpus import load_corpus
 
 CORPUS = os.path.expanduser("~/bench/labd_corpus.txt")
 TARGETS = os.path.expanduser("~/bench/targets")
@@ -158,7 +158,7 @@ def generate(prompt_ids, max_tokens):
                "temperature": 0, "logprobs": 0, "return_tokens_as_token_ids": True,
                "stream": True, "stream_options": {"include_usage": True}}
     toks, usage, t_first = [], {}, None
-    t0 = time.time()
+    t0 = time.perf_counter()
     for ev in harness.stream("/v1/completions", payload):
         if ev.get("usage"):
             usage = ev["usage"]
@@ -166,9 +166,9 @@ def generate(prompt_ids, max_tokens):
             lp = ch.get("logprobs") or {}
             if lp.get("tokens"):
                 if t_first is None:
-                    t_first = time.time()
+                    t_first = time.perf_counter()
                 toks.extend(lp["tokens"])
-    t_end = time.time()
+    t_end = time.perf_counter()
     ids = ids_from_logprobs(toks)
     if ids is None:
         raise SystemExit("server did not honour return_tokens_as_token_ids -- "
@@ -176,15 +176,7 @@ def generate(prompt_ids, max_tokens):
     return ids, (t_first or t_end) - t0, t_end - (t_first or t_end), usage
 
 
-if not os.path.exists(CORPUS):
-    docs = [open(f).read() for f in sorted(glob.glob(os.path.expanduser("~/qwen-serving/*.md")) +
-                                           glob.glob(os.path.expanduser("~/qwen-serving/*/README.md")))]
-    text = "\n\n".join(docs)
-    while len(text) < 200000:
-        text += "\n\n" + "\n\n".join(docs)
-    os.makedirs(os.path.dirname(CORPUS), exist_ok=True)
-    open(CORPUS, "w").write(text)
-doc = open(CORPUS).read()[: int(CTX * 3.6)]
+doc = load_corpus(CORPUS)[: int(CTX * 3.6)]
 
 ALL_TASKS = [
     ("copy", "Gengiv ordret de første 60 linjer af dokumentet. Ingen kommentarer, kun teksten."),
