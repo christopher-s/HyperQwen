@@ -216,17 +216,27 @@ day by Plan B. Next: Plan B (0.32).
       (QWEN_ROUTER_MAX_TOKENS; A/B arms 16384 and 32768, see 38).
     Router restart is the deploy mechanism (it is a per-connection proxy; use
     a low-traffic window and check :8020 health after).
-38. [ ] Run the A/B on one lane (gpu2 is the quieter lane): arms =
-    (a) control: force-xhigh + 8192 (today's config);
-    (b) medium + 16384; (c) medium + 32768; (d) xhigh + 32768.
-    Battery: repeated-n-gram loop counter over reasoning+content,
-    content-null rate, finish reasons, output tokens, malformed tool-call
-    check on a tool-shaped prompt, a long-form generation that must produce
-    content (the essay shape), completion wall time. n>=3 per arm, salted
-    prompts. Adopt per the results, not the plan: expected shape is that
-    (c) or (d) wins on agent-completion quality; adopt the winner, keep
-    (a) documented as rollback. Updates item 2 (reasoning-policy A/B) and
-    item 15 (the 32,768 arm here supersedes the planned 16,384 if it wins).
+38. [x] Run the A/B on the gpu2 lane (2026-10-31 12:40-12:54, 4 arms x 3
+    reps x 2 probe shapes; bench/effort_ab_20261031.py, raw record
+    bench-results/unlock-rebaseline-20261031/effort-ab-20261031.txt):
+    RESULTS — arm (a) legacy xhigh+8192: essay 3/3 finish=length,
+    content_chars=0, 26.8-28.4K reasoning chars, 199-714 repeated 8-grams,
+    ~89 s wasted per request. Arm (b) medium+16384: essay 3/3 finish=stop,
+    5.0-5.6K content chars, ~1.1-1.2K reasoning chars, loops 0, ~22 s.
+    Arm (c) medium+32768: essay 3/3 finish=stop, 5.2-5.6K content, loops 0
+    (one rep had 58 from reasoning-space re-drafting), ~22 s. Arm
+    (d) xhigh+32768: essay 3/3 finish=stop BUT 10.9-17.2K completion tokens
+    with 33-47K reasoning chars vs ~6K content, loops8 1067-2282 (reasoning
+    re-drafting), 112-171 s — 5x the wall time for +0.5K content chars.
+    Tool calls: clean JSON args, zero malformed, all arms (the qwen3_coder
+    path is unaffected by effort). ADOPTED: v1 policy (default medium) +
+    16384 injected default. The 32K arm bought nothing over 16K at medium
+    on these shapes and xhigh is contra-indicated for routine traffic on
+    this checkpoint (its extra tokens go to reasoning re-drafting, not
+    answer quality); 32K remains available to callers who set it explicitly
+    and matches Bifrost's advertised max_output_tokens. Item 2 (reasoning
+    A/B) and item 15 (output ceiling) are resolved by this record: medium
+    default, 16,384 ceiling, per-request override honored.
 39. [ ] After adoption: set Hermes config reasoning_effort for
     qwen-gpu0|gpu2 to the adopted default (it becomes live instead of
     dead-lettered), confirm the Bifrost max_output_tokens row matches the
