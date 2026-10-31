@@ -231,18 +231,47 @@ profile.
       bf16 KV would halve our pool; int8-per-token-head remains the right
       store. Realistic capacity levers stay GPU_UTIL (0.94; 0.95+ unstable),
       slab-off (+136 MiB), EMBED_UVA off.
-19. [ ] FlashInfer A/B on GPU2 (item 1 of the 2026-10-31 session): arm A =
-    serving config (CUSTOM + int8 per-token-head), arm B = FlashInfer
-    attention backend. FIRST gate: does FlashInfer accept
-    int8_per_token_head on sm_86 at all; if rejected, try fp8 KV + FlashInfer
-    as a secondary arm (upstream HyperQwen docs: fp8 KV on sm86 has exactly
-    one backend and it refuses FA3/TRITON; FLASHINFER acceptance unknown).
-    Measure: conc_ladder --salt, tok/step, TTFT at 128K shape, greedy
-    arithmetic, first-request content, loop check. HARD CONSTRAINT: GPU0
-    (Gen4 x4, index 0) is Elijah's while he uses the machine -- do not touch
-    gpu0, its container, or the router's GPU0 routing. All testing on GPU2
-    (index 2, x16). If arm B wins on GPU2, adoption on gpu0 is deferred until
-    Elijah's session ends AND Chris re-approves.
+19. [x] FlashInfer A/B on GPU2. (RAN 2026-10-31 ~19:28-19:45; GPU0 untouched
+    throughout -- Elijah's lane stayed up the whole session.)
+    SETUP: GPU2 production container stopped; test container on index 2 only
+    with the serving env minus PTH_FA, plus `--attention-backend FLASHINFER`.
+    GATE 1 (int8 KV + FlashInfer): FlashInferBackend's supported
+    kv_cache_dtypes are [auto, float16, bfloat16, fp8, fp8_e4m3, fp8_e5m2,
+    nvfp4, nvfp4_4over6] -- int8_per_token_head is NOT supported, so the
+    launcher auto-resolved to kv_cache_dtype=fp8. Arm B therefore ran
+    FlashInfer + fp8 KV, NOT our int8 store. Boots clean: FLASHINFER selected
+    ("out of potential backends: ['FLASHINFER','TRITON_ATTN']"), KV pool
+    215,625 tokens (vs 203,831 on our CUSTOM arm -- fp8 is a bigger pool at
+    the same UTIL), graphs captured PIECEWISE, first-request greedy "68"
+    clean.
+    MEASURED (same card, same model, same day):
+    - Long generation: arm B 99.4 tok/s (16,384-token gen in 165 s) -- but
+      content_chars=0: the whole budget burned into reasoning without the
+      effort default our router injects (test container talked to the engine
+      directly; production goes through the router). Latency figure valid,
+      the essay shape is not comparable to production.
+    - 3000-token list generations: 78.8 / 82.3 / 84.7 tok/s.
+    - OUR ARM A REFERENCE (bench-results gpu2-v032-slab): 84.2 tok/s
+      per-stream, ms/pass 33.9, tok/step 2.87; effort-A/B-era long-gen
+      equivalent runs ~22 s wall at medium effort.
+    - 2,707-token prompt + short reply: 1.2 s wall.
+    VERDICT: Arm B is throughput-EQUIVALENT on this card (99.4 vs ~84-92
+    tok/s range is within the MTP-acceptance variance we have measured
+    between boots: 83.0 -> 90.7 on identical software), while giving up the
+    PTH_FA int8 store's measured advantages: 128K TTFT 129 s (PTH_FA) vs
+    250 s (Triton int8, and FlashInfer fp8 was not faster at depth
+    upstream-HyperQwen); gotcha-40 documents FlashInfer fp8 KV + MTP +
+    prefix caching as the Xid-31 MMU fault tier (deterministic crash seen
+    twice on a 3090 at 28-34K context); and pool parity (215K vs 203K) does
+    not compensate losing the deep-context prefill advantage. #60532's +47%
+    does NOT transfer to our configuration: that measurement is NVFP4
+    weights (we are W4A16) and a decode-bound regime at C1 that our
+    MAX_SEQS=1 chat profile does not stress the same way.
+    DECISION: keep CUSTOM + PTH_FA int8 as the serving arm. FlashInfer arm
+    recorded as tested-and-declined on this card; re-test only if a future
+    vLLM adds int8 per-token-head support to FlashInfer or we move weights
+    to NVFP4. GPU2 restored to production (container restarting at report
+    time; verify Application startup before heavy use).
 
 - #424 retain SWA history at sparse Mamba offload boundaries: relevant only
   if a CPU KV-offload tier returns; fixes a DFlash2 offload-lookup zero-hit
