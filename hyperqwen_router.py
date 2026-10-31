@@ -21,6 +21,29 @@ PORT_GPU2_ALT = int(os.environ.get("PORT_GPU2_ALT", 18022))
 LISTEN_PORT = int(os.environ.get("PORT_ROUTER", 8020))
 LISTEN_HOST = os.environ.get("HOST_ROUTER", "0.0.0.0")
 
+# Reasoning-effort policy (ROADMAP 2026-10-31, items 37-39).
+#   v1      caller effort passes through, mapped to the template's levels;
+#           absent -> medium (EFFORT_DEFAULT)
+#   legacy  force xhigh everywhere (pre-2026-10-31 behavior; rollback)
+EFFORT_POLICY = os.environ.get("QWEN_ROUTER_EFFORT_POLICY", "v1")
+EFFORT_DEFAULT = "medium"
+# vLLM 0.32 protocol vocabulary -> the served template's levels
+# (xhigh/medium/low) plus none (= thinking off, engine derives
+# enable_thinking=false itself).
+EFFORT_MAP = {
+    "none": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+}
+# Injected default for requests that set neither max_tokens nor
+# max_completion_tokens. Blast-radius guard (ROADMAP item 15 / incident
+# d309a671); callers who set an explicit cap are unaffected.
+MAX_TOKENS_DEFAULT = int(os.environ.get("QWEN_ROUTER_MAX_TOKENS", 16384))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [router] %(message)s",
@@ -31,8 +54,8 @@ logger = logging.getLogger("router")
 MODELS_RESPONSE = json.dumps({
     "object": "list",
     "data": [
-        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 240000, "permission": []},
-        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 240000, "permission": []},
+        {"id": "qwen-gpu0", "object": "model", "owned_by": "black-monolith-gpu0-x4", "max_model_len": 200000, "permission": []},
+        {"id": "qwen-gpu2", "object": "model", "owned_by": "black-monolith-gpu2-x16", "max_model_len": 200000, "permission": []},
     ]
 }).encode("utf-8")
 
@@ -111,22 +134,56 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if j.get("repetition_penalty") is None:
                     j["repetition_penalty"] = 1.08
                 if "max_tokens" not in j and "max_completion_tokens" not in j:
-                    j["max_tokens"] = 8192
-                # Default reasoning effort to xhigh: the template's xhigh branch carries the
-                # anti-repetition instruction ("do not repeat, restart, paraphrase the same
-                # thought") that the medium branch lacks; xhigh also bounds routine questions
-                # to 512 thinking tokens. Valid values remain xhigh/medium/low — the template
-                # raises on anything else.
-                j["reasoning_effort"] = "xhigh"
-                if isinstance(j.get("chat_template_kwargs"), dict):
-                    if "reasoning_effort" in j["chat_template_kwargs"]:
-                        j["chat_template_kwargs"]["reasoning_effort"] = "xhigh"
-                if isinstance(j.get("reasoning"), dict):
-                    if "effort" in j["reasoning"]:
-                        j["reasoning"]["effort"] = "xhigh"
-                if isinstance(j.get("params"), dict) and isinstance(j["params"].get("reasoning"), dict):
-                    if "effort" in j["params"]["reasoning"]:
-                        j["params"]["reasoning"]["effort"] = "xhigh"
+                    j["max_tokens"] = MAX_TOKENS_DEFAULT
+                if EFFORT_POLICY == "v1":
+                    # Passthrough with validation + nearest-level mapping.
+                    # The served template accepts only xhigh/medium/low and
+                    # raises on anything else; vLLM 0.32's protocol accepts the
+                    # OpenAI vocabulary (none/minimal/low/medium/high/xhigh/max),
+                    # so map that vocabulary onto the template's three levels
+                    # (plus none = thinking off) instead of forwarding unknown
+                    # values into the template's raise path. Absent -> medium.
+                    # Precedence: chat_template_kwargs > top-level > reasoning.effort
+                    # > params.reasoning.effort (mirrors the old overwrite order).
+                    raw_effort = None
+                    raw_source = None
+                    ctk = j.get("chat_template_kwargs")
+                    if isinstance(ctk, dict) and "reasoning_effort" in ctk:
+                        raw_effort, raw_source = ctk.get("reasoning_effort"), "ctk"
+                    elif j.get("reasoning_effort") is not None:
+                        raw_effort, raw_source = j.get("reasoning_effort"), "top"
+                    elif isinstance(j.get("reasoning"), dict) and j["reasoning"].get("effort") is not None:
+                        raw_effort, raw_source = j["reasoning"].get("effort"), "reasoning"
+                    elif isinstance(j.get("params"), dict) and isinstance(j["params"].get("reasoning"), dict) \
+                            and j["params"]["reasoning"].get("effort") is not None:
+                        raw_effort, raw_source = j["params"]["reasoning"].get("effort"), "params"
+                    mapped = EFFORT_MAP.get(str(raw_effort).lower()) if raw_effort is not None else None
+                    if mapped is None:
+                        if raw_effort is not None:
+                            logger.warning("effort %r from %s not recognized; mapping to %s",
+                                           raw_effort, raw_source, EFFORT_DEFAULT)
+                        mapped = EFFORT_DEFAULT
+                    j["reasoning_effort"] = mapped
+                    if isinstance(ctk, dict):
+                        ctk["reasoning_effort"] = mapped
+                    if isinstance(j.get("reasoning"), dict) and "effort" in j["reasoning"]:
+                        j["reasoning"]["effort"] = mapped
+                    if isinstance(j.get("params"), dict) and isinstance(j["params"].get("reasoning"), dict) \
+                            and "effort" in j["params"]["reasoning"]:
+                        j["params"]["reasoning"]["effort"] = mapped
+                    logger.info("effort: requested=%r (%s) -> %s", raw_effort, raw_source, mapped)
+                else:
+                    # Legacy policy (rollback): force xhigh everywhere.
+                    j["reasoning_effort"] = "xhigh"
+                    if isinstance(j.get("chat_template_kwargs"), dict):
+                        if "reasoning_effort" in j["chat_template_kwargs"]:
+                            j["chat_template_kwargs"]["reasoning_effort"] = "xhigh"
+                    if isinstance(j.get("reasoning"), dict):
+                        if "effort" in j["reasoning"]:
+                            j["reasoning"]["effort"] = "xhigh"
+                    if isinstance(j.get("params"), dict) and isinstance(j["params"].get("reasoning"), dict):
+                        if "effort" in j["params"]["reasoning"]:
+                            j["params"]["reasoning"]["effort"] = "xhigh"
                 # Qwen chat template requires the system message first. Hermes injects
                 # mid-conversation system messages (out-of-band steering, tool preambles);
                 # hoist every system message to the front preserving their relative order.

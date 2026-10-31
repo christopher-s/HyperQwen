@@ -24,6 +24,13 @@ fi
 # A leftover failed unit of the same name would block a fresh start.
 systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
 
+# Policy knobs (ROADMAP 2026-10-31 items 37-39). QWEN_ROUTER_EFFORT_POLICY=v1
+# (caller effort passthrough with nearest-level mapping, default medium) or
+# =legacy (force xhigh everywhere, pre-2026-10-31 rollback). QWEN_ROUTER_MAX_
+# TOKENS sets the injected default for uncapped requests.
+EFFORT_POLICY="${QWEN_ROUTER_EFFORT_POLICY:-v1}"
+MAX_TOKENS="${QWEN_ROUTER_MAX_TOKENS:-16384}"
+
 # --collect removes the transient unit once it exits, so the name is reusable.
 systemd-run --user --unit="$UNIT" --collect --quiet \
   --property=Type=simple \
@@ -31,6 +38,8 @@ systemd-run --user --unit="$UNIT" --collect --quiet \
   --property=StandardError=append:"$LOGFILE" \
   --property=WorkingDirectory=/home/chris/tools/hyperqwen \
   --property=Restart=no \
+  --setenv=QWEN_ROUTER_EFFORT_POLICY="$EFFORT_POLICY" \
+  --setenv=QWEN_ROUTER_MAX_TOKENS="$MAX_TOKENS" \
   /usr/bin/python3 "$ROUTER_PY"
 
 for _ in $(seq 1 40); do
