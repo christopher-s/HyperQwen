@@ -12,21 +12,33 @@ effort policy (caller effort mapped to nearest level, absent -> medium,
 QWEN_ROUTER_EFFORT_POLICY=legacy rollback) with QWEN_ROUTER_MAX_TOKENS=16384
 injected default, repetition_penalty 1.08. black-monolith @ 0bee80a, pushed.
 
+## Testing policy (Chris, 2026-10-31)
+
+Chris tests Qwen himself during normal use and escalates issues here; long
+automated soak/verification runs are the exception, run only when a change
+cannot be observed interactively (capacity ceilings, memory pressure, timing
+regimes). Items are tagged accordingly: [CHEAP] = minutes, [CHRIS] = covered
+by normal use, [SOAK] = the only class that justifies long unattended runs.
+
 ## P1 — engine/stack debt from the 0.32 adoption
 
 1. [ ] Full 204K capacity stress on the 0.94 + slab sizing: the standing
-   195,670 prompt + 6,000 completion pattern plus near-ceiling exact retrieval.
-   The old pass predates the slab workspace (136 MiB) and the 0.94 UTIL move;
-   boot health is verified, deep-context endurance is not. Long-soak (>=4 h
-   mixed traffic) at 0.94 belongs in the same pass.
+   195,670 prompt + 6,000 completion pattern plus near-ceiling exact retrieval,
+   plus a long soak (>=4 h mixed traffic) at 0.94. [SOAK] — this is the one
+   genuine soak: interactive use cannot reach 204K tokens casually, and
+   gotcha-4's failure band is time/pressure dependent. Everything else about
+   0.94+slab already passed interactive gates on 2026-10-31.
 2. [ ] At the next vLLM pin bump, re-evaluate every `Retires-when:` line in
-   patches/ (grep "Retires-when", diff each against the actual version). The
-   trigger event ("next pin bump") fired with the 2026-10-31 0.32 adoption;
-   the sweep itself is still owed.
+    patches/ (grep "Retires-when", diff each against the actual version). The
+    trigger event ("next pin bump") fired with the 2026-10-31 0.32 adoption;
+    56 patch files carry the marker. [CHEAP] — mechanical grep + diff review;
+    retire-and-rebuild only where the premise no longer holds.
 3. [ ] PR #326 MTP A/B: the fix is integrated (merge a2769dc, in both serving
    images) but the standing A/B battery (MTP vs SPEC=off, 18 synthetic
-   requests x 4, raw token IDs, finish reasons) never ran against it. Run it
-   or close it as superseded by the 0.32 gate results.
+   requests x 4, raw token IDs, finish reasons) never ran against it.
+   [CHRIS->CHEAP] — daily MTP use since integration is the real test; if
+   Chris sees no spec-decode weirdness, close as superseded by the 0.32 gate
+   results (GSM8K 0.970 n=200 upstream on this series). Escalation-triggered.
 
 ## P1 — Hermes tool-call integrity and lane reliability (items 11-28, paused
 ### at Chris's request 2026-10-31; resume here first)
@@ -50,19 +62,25 @@ may no longer reproduce.
 
 4. [ ] Build a local, redacted reproduction harness from one stored failing
    request. Send it directly to GPU0 :18020, bypassing the shared router and
-   Bifrost; save raw SSE bytes plus normalized output.
+   Bifrost; save raw SSE bytes plus normalized output. [CHEAP] — a script and
+   a handful of requests.
 5. [ ] Run the same payload through :8020 and Bifrost. Diff all three
    boundaries: model stream, router stream, Bifrost responses_output/tool_calls.
    First re-check whether the symptom still reproduces at all on 0.32 + the
    v1 router (2026-10-31 A/B tool probes: 12/12 clean JSON args, no malformation).
+   [CHEAP]. Fallback per testing policy: skip the harness entirely and let
+   normal Hermes use be the probe — if Chris's daily tool traffic stays clean
+   for a few days, close 4-7 as not-reproducing-on-0.32 and reopen only on
+   escalation.
 6. [ ] Classify the defect from the raw capture: malformed XML from the model
    -> revise tool template/policy; valid XML plus malformed normalized
    arguments -> patch or upgrade the vLLM qwen3_coder parser; changed bytes at
-   :8020 -> fix the router proxy.
+   :8020 -> fix the router proxy. [CHEAP] once 4-5 produce a capture; the fix
+   itself is scoped by what the classification finds.
 7. [ ] Add deterministic regression fixtures for the observed failure forms:
    leaked `</parameterparameter=...>` markup, missing scalar values such as
    `"replace_all":`, unterminated strings, parallel batches with one valid +
-   one malformed call.
+   one malformed call. [CHEAP] — pytest-style fixtures against the parser.
 
 Acceptance: the captured raw boundary identifies the first component that
 emits invalid tool arguments, and the regression fixture fails before its fix.
@@ -73,6 +91,8 @@ emits invalid tool arguments, and the regression fixture fails before its fix.
    engine-direct or via Bifrost). Verify where a ceiling is actually enforced
    for Responses and close the gap if any. Record prompt/generated tokens,
    finish reason, tool name, argument length, JSON validity, ceiling-fired.
+   [CHEAP] — read the Responses request schema in the image, one or two probe
+   requests; only a found gap leads to a small router/Bifrost-side fix.
 
 Acceptance: a malformed tool call cannot decode to the remaining 200K window
 on either API surface.
@@ -82,7 +102,9 @@ on either API surface.
    retryable busy response immediately (lane + retry guidance) instead of
    holding a silent socket; concurrency tests per lane including busy-lane +
    healthy-sibling. Keep Bifrost's 300 s stream-idle timeout unchanged during
-   this work.
+   this work. [CHEAP implementation, cheap test] — a small router change;
+   testing is two simultaneous curls, not a soak. The payoff (no silent 5-minute
+   stalls) is directly felt in normal use.
 
 Acceptance: no same-lane request waits silently into the stream-idle timeout;
 sibling-lane traffic independent.
@@ -92,7 +114,9 @@ sibling-lane traffic independent.
     replace swallowed IncompleteReadError/ConnectionResetError/BrokenPipeError
     with request-ID/lane/byte-count diagnostics; SIGTERM-during-stream test
     (complete response or explicit retryable error; no truncated success; no
-    SIGKILL).
+    SIGKILL). [CHEAP implementation, CHRIS-observed] — code change plus one
+    deliberate reload while a stream runs; the cross-lane kill scenario is
+    exactly what Chris hits in normal per-card operations.
 
 Acceptance: GPU2-only operations cause zero GPU0 connection failures;
 deliberate reloads finish inside the unit stop timeout.
@@ -104,7 +128,10 @@ deliberate reloads finish inside the unit stop timeout.
     stored under bench-results/tool-call-integrity/); validation battery
     (sequential tool turns, two simultaneous same-lane, simultaneous
     cross-lane, long-context patches, client cancellation, idle timeout,
-    router drain/reload).
+    router drain/reload). [CHEAP parts: router-side correlation IDs and the
+    capture mode. The full battery is [SOAK]-class and only worth running if
+    4-10 land a real fix — otherwise drop it and let production traffic be
+    the validation.]
 
 Final acceptance: zero malformed tool arguments in the battery; zero silent
 same-lane queues; zero cross-lane interruption during per-card operations; no
@@ -117,16 +144,21 @@ router/Bifrost/image state until replacements pass their acceptance gate.
 
 ## P2
 
-12. [ ] `repetition_detection` circuit breaker via the router.
-    First arm: {"max_pattern_size": 32, "min_pattern_size": 1, "min_count": 8}.
-    Log every trigger with request ID, lane, prompt/generated tokens, finish
-    reason, detector settings, prefix-cache state, preceding request ID.
-    (Note: vLLM 0.32's chat protocol carries `repetition_detection` natively —
-    check whether the engine-level parameter satisfies this before wiring it
-    into the router.)
-13. [ ] Diagnostic capture on every loop-class finish (length, repetition,
-    repeated-token threshold): rewritten request body, raw output token IDs,
-    last 256 prompt IDs, effort, sampler values, spec mode, target GPU.
+12. [ ] Loop-defense injection: the engine natively supports
+    `repetition_detection` per request (vLLM 0.32 SamplingParams:
+    RepetitionDetectionParams{max_pattern_size, min_pattern_size, min_count};
+    ends generation early on a repeated N-gram). First arm:
+    {"max_pattern_size": 32, "min_pattern_size": 1, "min_count": 8}.
+    Decide the injection point (router default vs launcher --repetition-detection
+    vs leave per-request) and whether triggers need the full diagnostic log
+    (item 13) or just a lane+request-ID line. CHEAP: it is a parameter pass,
+    a few minutes to wire, minutes to verify with a deliberately looped prompt.
+13. [ ] Loop-class diagnostic capture (length/repetition finishes): rewritten
+    request body, output token IDs, effort, sampler values, target GPU.
+    Re-scope after 12: if the engine's detector ends loops early, the capture
+    matters only for post-mortems, so a small log line may suffice.
+    Note: the A/B already records loop-class data for bench runs; this item is
+    about production traffic only.
 
 ## P3
 
@@ -140,7 +172,12 @@ router/Bifrost/image state until replacements pass their acceptance gate.
     (External evidence 2026-10-31: Swift 1.5 targets up to 58.5% fewer
     thinking tokens with LiveCodeBench accuracy claims; evaluate against our
     v1 effort policy — it may be redundant now that medium is the default.)
-17. [ ] Retire `/home/chris/tools/qwen38-27b-rtx3090` (pre-rename stale clone).
+    [CHRIS] — a checkpoint swap Chris would feel directly in daily use;
+    decide only if medium-default still feels slow. No automated eval planned.
+17. [x] Retire `/home/chris/tools/qwen38-27b-rtx3090` (pre-rename stale clone).
+    (Already gone — directory does not exist on disk as of 2026-10-31; only
+    doc mentions remain in docs/reproductions and single-user/README, which
+    are historical records, not live references.)
 
 ## Watch list (upstream, no action yet)
 
