@@ -231,47 +231,47 @@ profile.
       bf16 KV would halve our pool; int8-per-token-head remains the right
       store. Realistic capacity levers stay GPU_UTIL (0.94; 0.95+ unstable),
       slab-off (+136 MiB), EMBED_UVA off.
-19. [x] FlashInfer A/B on GPU2. (RAN 2026-10-31 ~19:28-19:45; GPU0 untouched
-    throughout -- Elijah's lane stayed up the whole session.)
-    SETUP: GPU2 production container stopped; test container on index 2 only
-    with the serving env minus PTH_FA, plus `--attention-backend FLASHINFER`.
-    GATE 1 (int8 KV + FlashInfer): FlashInferBackend's supported
-    kv_cache_dtypes are [auto, float16, bfloat16, fp8, fp8_e4m3, fp8_e5m2,
-    nvfp4, nvfp4_4over6] -- int8_per_token_head is NOT supported, so the
-    launcher auto-resolved to kv_cache_dtype=fp8. Arm B therefore ran
-    FlashInfer + fp8 KV, NOT our int8 store. Boots clean: FLASHINFER selected
-    ("out of potential backends: ['FLASHINFER','TRITON_ATTN']"), KV pool
-    215,625 tokens (vs 203,831 on our CUSTOM arm -- fp8 is a bigger pool at
-    the same UTIL), graphs captured PIECEWISE, first-request greedy "68"
-    clean.
-    MEASURED (same card, same model, same day):
-    - Long generation: arm B 99.4 tok/s (16,384-token gen in 165 s) -- but
-      content_chars=0: the whole budget burned into reasoning without the
-      effort default our router injects (test container talked to the engine
-      directly; production goes through the router). Latency figure valid,
-      the essay shape is not comparable to production.
-    - 3000-token list generations: 78.8 / 82.3 / 84.7 tok/s.
-    - OUR ARM A REFERENCE (bench-results gpu2-v032-slab): 84.2 tok/s
-      per-stream, ms/pass 33.9, tok/step 2.87; effort-A/B-era long-gen
-      equivalent runs ~22 s wall at medium effort.
-    - 2,707-token prompt + short reply: 1.2 s wall.
-    VERDICT: Arm B is throughput-EQUIVALENT on this card (99.4 vs ~84-92
-    tok/s range is within the MTP-acceptance variance we have measured
-    between boots: 83.0 -> 90.7 on identical software), while giving up the
-    PTH_FA int8 store's measured advantages: 128K TTFT 129 s (PTH_FA) vs
-    250 s (Triton int8, and FlashInfer fp8 was not faster at depth
-    upstream-HyperQwen); gotcha-40 documents FlashInfer fp8 KV + MTP +
-    prefix caching as the Xid-31 MMU fault tier (deterministic crash seen
-    twice on a 3090 at 28-34K context); and pool parity (215K vs 203K) does
-    not compensate losing the deep-context prefill advantage. #60532's +47%
-    does NOT transfer to our configuration: that measurement is NVFP4
-    weights (we are W4A16) and a decode-bound regime at C1 that our
-    MAX_SEQS=1 chat profile does not stress the same way.
-    DECISION: keep CUSTOM + PTH_FA int8 as the serving arm. FlashInfer arm
-    recorded as tested-and-declined on this card; re-test only if a future
-    vLLM adds int8 per-token-head support to FlashInfer or we move weights
-    to NVFP4. GPU2 restored to production (container restarting at report
-    time; verify Application startup before heavy use).
+19. [x] FlashInfer A/B on GPU2. (RAN TWICE 2026-10-31; GPU0 untouched --
+    Elijah's lane stayed up the whole session.)
+    ARM B1 (~19:28): FlashInfer + fp8 KV + CUDAGRAPH_MODE=PIECEWISE (env
+    inherited). RESULT: 99.4 tok/s long-gen, 78.8-85.3 tok/s lists, KV pool
+    215,625, first-request 68 clean. Initially read as "equivalent, declined."
+    ARM B2 (~20:00) — REDO after Chris pushed back: B1 was methodologically
+    flawed. I had pinned PIECEWISE, which is exactly the mode that blocks
+    #60532's mechanism (the win is spec-decode VERIFY steps captured as FULL
+    decode graphs, unlocked by FlashInfer's UNIFORM_BATCH CG support;
+    resolve_cudagraph_mode_and_sizes downgrades spec-decode decode-FULL to
+    PIECEWISE when min_cg_support < UNIFORM_BATCH). B2 = FlashInfer + fp8 KV
+    with NO cudagraph pin (launcher default): engine resolved
+    CUDAGraphMode.FULL_AND_PIECEWISE — the #60532 configuration, verified in
+    the boot log. MEASURED B2: greedy 68 clean 0.3 s; facts lists 79.1 / 82.6
+    / 85.3 tok/s (identical to B1 within noise); 16,384-token gen 104.0
+    tok/s (vs 99.4 B1, +4.6%); 25K-prompt + 4K-gen 70.5 tok/s. Arm A
+    reference 84.2 tok/s per-stream (v032-slab record), boot-to-boot MTP
+    variance spans 83.0 -> 90.7.
+    GATE FACTS (source-read from the image):
+    - FlashInfer supported KV dtypes: auto/float16/bfloat16/fp8/fp8_e4m3/
+      fp8_e5m2/nvfp4/nvfp4_4over6. int8_per_token_head is NOT supported;
+      the per-token-head family (int8/int4/fp8) exists ONLY on TRITON_ATTN
+      upstream and our CUSTOM plugin. There is no third option that pairs
+      FlashInfer with a per-token-head store.
+    - fp8 (block) KV is the ONLY FlashInfer pairing available to us; B2 is
+      the correct and complete test of #60532 on our weights.
+    CONCLUSION (now properly grounded): even with FULL_AND_PIECEWISE active
+    and UNIFORM_BATCH engaged, FlashInfer+fp8 delivers 104 vs our ~84-92
+    tok/s (within or near MTP boot variance) on short/medium generations,
+    LOSES at depth (70.5 tok/s at 20K prompt vs PTH_FA's deeper-context
+    advantage), loses 128K TTFT (129 s PTH_FA vs ~250 s fp8 tiers,
+    upstream-HyperQwen measured), and sits in gotcha-40's Xid-31 fault tier
+    (fp8 KV + MTP + prefix caching on 3090). #60532's +47% was NVFP4
+    weights + a decode-bound C1 regime; on W4A16 + hybrid GDN + chat shapes
+    the mechanism is active and produces ~nothing. CLOSING this as
+    tested-and-declined is now evidence-based, twice over: same verdict
+    with the mechanism properly armed. Re-test triggers unchanged:
+    FlashInfer gains int8 per-token-head support, or weights move to NVFP4.
+    ALSO LEARNED: the B1 essay content-null at 16K was the direct-to-engine
+    path missing the router's effort default (medium) — reasoning ate the
+    budget. Production traffic goes through the router and is unaffected.
 
 - #424 retain SWA history at sparse Mamba offload boundaries: relevant only
   if a CPU KV-offload tier returns; fixes a DFlash2 offload-lookup zero-hit
