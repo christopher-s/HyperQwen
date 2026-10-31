@@ -197,6 +197,53 @@ router/Bifrost/image state until replacements pass their acceptance gate.
 
 ## Watch list (upstream, no action yet)
 
+### 2026-10-31 vLLM upstream scan (0.32.0 pinned; main +1,369 commits ahead)
+
+Fleet context: attention-backend CUSTOM (PTH_FA int8 per-token-head plugin),
+MTP k=3, hybrid 48 GDN + 16 FA layers, sm_86, 24 GB. Scan filtered for that
+profile.
+
+18. [x] Scan documented (this section). Key finds:
+    - vLLM #60532 (MERGED): FlashInfer fa2 uniform-batch spec-decode
+      verification in FULL CUDA graphs on pre-SM90. Upstream SM80 Qwen3.8-27B
+      NVFP4 MTP k=3: 73.6 -> 108.1 tok/s TP=1 (+47%), bitwise-same greedy
+      output; no change without spec decode. OUR PATH DOES NOT USE IT: we pin
+      attention-backend CUSTOM (PTH_FA plugin), so FlashInfer never runs.
+      Item 19 is the A/B.
+    - vLLM #62113 (OPEN, conflicting with main): 16-byte-aligned
+      per-token-head KV slots. RTX 3080 int8_per_token_head kernel 1.25-1.96x
+      faster, 128K TTFT -21%; cost +4.6% KV memory at head_size 256 (ours) --
+      higher performance bought with a small KV spend, quant untouched.
+      ACTION: re-check on rebase; port into our patch series when it lands.
+    - vLLM #63944 (OPEN issue): int8_per_token_head scale-view FILL overwrites
+      GDN state in hybrid models -> garbage first request after boot.
+      CHECKED OUR IMAGE: our triton_attn.py _ensure_scale_caches builds views
+      with NO fill (read from hyperqwen-pthfa:032-b), so we do not carry the
+      bug. Watch: if upstream restructures view creation, re-verify
+      first-request behavior at the next pin bump (neighbors our #404 patch).
+    - Marginal merged: #64425 in_proj_ba aux-stream overlap (TPOT -2.7% C=1,
+      bitwise identical; interacts with our #396/#418 GEMM patch -- A/B first),
+      #64419 GDN prefill empty+in-place (-1.9% on no-compile base),
+      #64509 fused norm+quant (NVFP4/FP8 consumers; we are W4A16 -- mostly
+      inapplicable), #64482/#64650 skinny GEMM plans (SM100/SM103 only).
+    - KV capacity/precision: NOTHING merged for NVIDIA sm86 that grows KV
+      without reducing quant. ROCm got Octave 3-bit KV (#59774, AMD-only).
+      bf16 KV would halve our pool; int8-per-token-head remains the right
+      store. Realistic capacity levers stay GPU_UTIL (0.94; 0.95+ unstable),
+      slab-off (+136 MiB), EMBED_UVA off.
+19. [ ] FlashInfer A/B on GPU2 (item 1 of the 2026-10-31 session): arm A =
+    serving config (CUSTOM + int8 per-token-head), arm B = FlashInfer
+    attention backend. FIRST gate: does FlashInfer accept
+    int8_per_token_head on sm_86 at all; if rejected, try fp8 KV + FlashInfer
+    as a secondary arm (upstream HyperQwen docs: fp8 KV on sm86 has exactly
+    one backend and it refuses FA3/TRITON; FLASHINFER acceptance unknown).
+    Measure: conc_ladder --salt, tok/step, TTFT at 128K shape, greedy
+    arithmetic, first-request content, loop check. HARD CONSTRAINT: GPU0
+    (Gen4 x4, index 0) is Elijah's while he uses the machine -- do not touch
+    gpu0, its container, or the router's GPU0 routing. All testing on GPU2
+    (index 2, x16). If arm B wins on GPU2, adoption on gpu0 is deferred until
+    Elijah's session ends AND Chris re-approves.
+
 - #424 retain SWA history at sparse Mamba offload boundaries: relevant only
   if a CPU KV-offload tier returns; fixes a DFlash2 offload-lookup zero-hit
   confirmed on f382342; unmerged, author-validated on H200/A4000.
