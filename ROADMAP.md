@@ -356,6 +356,48 @@ llama.cpp, QEngine, Strata, PrismML.
     VERDICT: nothing to port to the PTH_FA vLLM lanes. The fleet remains at
     the measured optimum for this profile. QEngine recorded as the one real
     alternative engine; mamba-block-size ruled out with numbers.
+
+### 2026-11-01 MTP draft-head spike (item 21)
+
+21. [ ] Improve MTP acceptance via a fine-tuned draft head. Live telemetry
+    (2026-11-01, both lanes): tok/step 1.87 (gpu0) / 1.89 (gpu2), accept
+    62.4% / 63.1%, per-position decay IDENTICAL on both lanes
+    (pos0 0.80 -> pos1 0.61 -> pos2 0.46-0.47). Same shape on two
+    independently-used lanes = structural draft-head property, not config.
+    Counterfactual: pos2 holding pos1's rate adds only ~+0.14 tok/step, so
+    chain depth is not the lever; per-position head quality is.
+    RESEARCHED (all verified 2026-11-01):
+    - No public vLLM-loadable fine-tuned Qwen3.8-27B MTP head exists.
+      HermiHg/Qwen3.8-27B-Optimized-MTP-Heads-exl3 is EXL3/exllamav3-only
+      (sidecar size optimization, geomean accept 0.403-0.418, Apache-2.0);
+      QEngine's model_mtp_ft.safetensors (849,400,392 B, ~8-9% more accepted
+      drafts upstream-claimed) is a GitHub release blob for their engine,
+      NC-licensed context, but same-base MTP head — inspectable.
+    - The training path is turnkey: vllm-project/speculators supports MTP
+      head fine-tuning per Tencent's FastMTP (arXiv 2509.1836): Convert
+      (MTPConverter lifts native mtp.*) -> Train (teacher-forced multi-step,
+      exp-decay weights [0.51,0.31,0.18] at k=3, only MTP layers trainable,
+      embed/lm_head frozen, online hidden-state generation from a live vLLM
+      server) -> Stitch (merge back into verifier checkpoint). ~15 tensors /
+      ~800M params. quivent/qwen-mtp-corpus ladder: 79% untuned -> 85-90%
+      self-distilled -> 95% multi-layer. Deployment = checkpoint-level mtp.*
+      tensor swap (Red Hat FP8-MTP gist demonstrates the rewrite mechanism).
+    - Documented negative result (pirateface Holodeck-Lounge): fine-tuning on
+      the wrong distribution REGRESSED acceptance (49.75% vs 58.55%). Train
+      on OUR traffic, not generic corpora.
+    PLAN:
+    a. [CHEAP, 0 GPU-h] Fetch QEngine model_mtp_ft.safetensors; inspect tensor
+       names/shapes against our checkpoint's mtp.*; if the layout matches,
+       clone the checkpoint with the swapped head and A/B acceptance on GPU2
+       during an idle window. License: engine is PolyForm NC — fine for
+       personal use, do not ship.
+    b. [REAL] speculators convert -> train (on our own captured traffic
+       corpus, Bifrost/router logs as source) -> stitch -> A/B on GPU2.
+       Target: 1.9 -> 2.1-2.3 tok/step (+12-20% effective decode), the only
+       double-digit decode lever this hardware offers. Rollback = original
+       checkpoint unchanged (train writes a copy).
+    Evidence base: bench/spec counters before/after on the same seeded
+    battery; keep the A/B on a dedicated boot (club-3090 methodology).
 - 0.32-rebase candidates recorded 2026-10-16 (#59973 quantized draft lm_head,
   #46963 NVFP4 paged KV, #57881 Mamba ops out of CUDA graphs, #61422/#59735
   free riders): several landed with the 0.32 series; re-diff the remaining
