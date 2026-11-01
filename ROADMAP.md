@@ -396,6 +396,23 @@ llama.cpp, QEngine, Strata, PrismML.
        Target: 1.9 -> 2.1-2.3 tok/step (+12-20% effective decode), the only
        double-digit decode lever this hardware offers. Rollback = original
        checkpoint unchanged (train writes a copy).
+    PHASE B QWOPUS EXTENSION (2026-11-01): run the b. pipeline against the
+    ABLITERATED Qwopus Coder-Flash build (item 22), not Leminkozey, once it
+    is the daily driver — the head must draft for the serving distribution,
+    and Leminkozey may be retired by then. Verified tooling: speculators
+    ships a native MTP algorithm doc (MTPConverter -> train with frozen
+    embed/lm_head + normalized exp-decay step weights, beta 0.6 default ->
+    `stitch` CLI merges the head back), plus generate_offline_data /
+    regenerate_responses CLIs for self-distilling OUR prompt corpus through
+    OUR model (the exact fix for the distribution-mismatch failure that
+    killed QEngine's head and Holodeck-Lounge's fine-tune). Red Hat
+    published the FastMTP-heads serving recipe (developers.redhat.com,
+    2026-09). Head-only training (~15 tensors, ~850M params, 1 decoder
+    layer + projections) fits one 3090 in days. ADOPTION GATE: seeded
+    conc_ladder (N=1 x3, salted, 4096-ctx) must beat 2.77 tok/step — the
+    number both heads scored in tonight's protocol A/B. Sequence:
+    item 22 done -> daily traffic accumulates -> convert/distill/train ->
+    stitch -> gate -> swap.
     Evidence base: bench/spec counters before/after on the same seeded
     battery; keep the A/B on a dedicated boot (club-3090 methodology).
     PHASE A EXECUTED 2026-11-01 (pre-A/B state):
