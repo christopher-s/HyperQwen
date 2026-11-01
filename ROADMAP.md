@@ -398,6 +398,24 @@ llama.cpp, QEngine, Strata, PrismML.
        checkpoint unchanged (train writes a copy).
     Evidence base: bench/spec counters before/after on the same seeded
     battery; keep the A/B on a dedicated boot (club-3090 methodology).
+    PHASE A EXECUTED 2026-11-01 (pre-A/B state):
+    - Layout audit PASSED: QEngine's model_mtp_ft.safetensors carries the
+      identical 15-tensor mtp.* set (same names, dtypes BF16, shapes) as our
+      checkpoint's model_extra_tensors.safetensors. 1 of 15 tensors is
+      byte-identical (mtp.pre_fc_norm_embedding.weight); 14 differ — a real
+      fine-tune, not a re-upload.
+    - A/B checkpoint built:
+      /mnt/500gb-ssd/ai/models/leminkozey-Qwen3.8-27B-Uncensored-W4A16-AutoRound-mtpft/
+      — hardlinks of all original shards/config + model_extra_tensors.safetensors
+      replaced with the QEngine head verbatim (sha256 56cbd7d30e07ed7c...,
+      size 849,400,392 B = QEngine release v1.3.3.1 asset). Metadata block
+      NOT grafted (header lengths differ; engines read mtp.* by name).
+      Original checkpoint untouched.
+    - A/B arm: MODEL=/app/models/leminkozey-...-mtpft on the gpu2 compose
+      (MODELS_DIR mount covers it), served under the same qwen3.8-27b name.
+    - A/B NOT YET RUN — needs an idle window on GPU2 + the seeded battery
+      (bench counters before/after, dedicated boot). Baseline for comparison:
+      tok/step 1.89 / accept 63.1% / per-pos 0.80/0.62/0.47 (live 2026-11-01).
 - 0.32-rebase candidates recorded 2026-10-16 (#59973 quantized draft lm_head,
   #46963 NVFP4 paged KV, #57881 Mamba ops out of CUDA graphs, #61422/#59735
   free riders): several landed with the 0.32 series; re-diff the remaining
