@@ -416,6 +416,31 @@ llama.cpp, QEngine, Strata, PrismML.
     - A/B NOT YET RUN — needs an idle window on GPU2 + the seeded battery
       (bench counters before/after, dedicated boot). Baseline for comparison:
       tok/step 1.89 / accept 63.1% / per-pos 0.80/0.62/0.47 (live 2026-11-01).
+    A/B EXECUTED 2026-11-01 (gpu2, idle window, mtpft checkpoint booted at
+    GPU_UTIL 0.94 on hyperqwen-pthfa:032-b; boot clean, KV 203,831 tokens,
+    greedy first-request sanity clean, no preemptions, salted prompts = 0
+    cache hits):
+    - run_benchmarks.sh single (real-prompt cohorts): tok/step 2.56-2.74
+      across C1..C8, best 2.74 greedy C1; e2e 72-79 tok/s at C1 — but these
+      are NOT comparable to the lifetime-average counters (different prompt
+      mix than the engine's accumulated history).
+    - conc_ladder seeded A/B (the citable comparison; same protocol as the
+      2026-10-31 unlock rebaseline: N=1, 3 reps, 4096-ctx, out=256, salted):
+        mtpft: per-stream 80.1 tok/s (78.1/80.2/82.1) | ms/pass 34.6 | tok/step 2.77
+        stock: per-stream 83.0 tok/s             | ms/pass 33.2 | tok/step 2.77
+        delta: -3.4% per-stream, +4.4% ms/pass, tok/step FLAT
+    - Full-engine counters over the whole arm: accept 56.0% / 1.68 tok/step
+      vs lifetime 63.1% / 1.89 (mixed warmup + battery traffic).
+    VERDICT: REJECT the QEngine head for our lanes. Equal acceptance on the
+    seeded battery (2.77 = 2.77), slightly slower per pass, -3.4% per-stream;
+    the ~8-9% upstream claim does NOT transfer to our traffic/checkpoint.
+    Their head was trained on QEngine's own answers (llama.cpp-style serving,
+    RedHat INT4); ours is vLLM + Leminkozey W4A16 — distribution mismatch
+    confirmed empirically, matching the Holodeck-Lounge negative result.
+    Phase A closed 2026-11-01. Phase B (train OUR OWN head on OUR traffic via
+    speculators/FastMTP) remains the live path; the A/B harness and the
+    mtpft checkpoint dir are kept for exactly that comparison. GPU2 restored
+    to stock after the test.
 - 0.32-rebase candidates recorded 2026-10-16 (#59973 quantized draft lm_head,
   #46963 NVFP4 paged KV, #57881 Mamba ops out of CUDA graphs, #61422/#59735
   free riders): several landed with the 0.32 series; re-diff the remaining
