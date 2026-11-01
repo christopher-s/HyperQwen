@@ -441,7 +441,57 @@ llama.cpp, QEngine, Strata, PrismML.
     speculators/FastMTP) remains the live path; the A/B harness and the
     mtpft checkpoint dir are kept for exactly that comparison. GPU2 restored
     to stock after the test.
-- 0.32-rebase candidates recorded 2026-10-16 (#59973 quantized draft lm_head,
+
+22. [ ] Abliterate Qwopus3.8-27B-Coder-Flash with Heretic v2 + requant to
+    fleet format. First-mover: NO abliterated variant of this 2026-10-31
+    release exists (verified against the full HF model tree 2026-11-01 —
+    only older Qwopus 3.5/3.6 generations and Qwen3.8-Flash-Coder have
+    abliteration/heretic derivatives).
+    MODEL: Jackrong/Qwopus3.8-27B-Coder-Flash (unsloth/Qwen3.8-27B fine-tune,
+    qwen3_5 arch, agentic-coding focused: ~20K agent/tool-use examples
+    distilled from Qwen3.8-Flash-Max + DeepSeek-V4-Flash teachers + Nemotron
+    reasoning data; multimodal; Apache-2.0). Downloaded 52GB/18 shards to
+    /mnt/500gb-ssd/ai/models/Qwopus3.8-27B-Coder-Flash.
+    RUN (launched 2026-11-01): heretic-llm 2.0.0 venv at
+    /mnt/500gb-ssd/ai/heretic-run (torch 2.11.0+cu128, transformers 5.22.1),
+    config.toml: bf16, quantization=none, device_map auto,
+    max_memory={'0':'22GB','1':'22GB','cpu':'26GB'} (both 3090s; heretic CUDA
+    enumeration ≠ nvidia-smi order — its CUDA2 is the 3060 display card,
+    excluded; first-launch OOM gotcha recorded), offload_outputs_to_cpu=true,
+    n_trials=100, ARA modifier (lora_rank 50, row-magnitude preservation),
+    KeywordRate+KLDivergence scorers, checkpoints/ for study resume.
+    DECISION: pure abliteration (refusals only) first — noslop/nosyco are
+    separate runs (one keyword-list objective per run; combined config
+    possible via scorer instance_name but doubles trial eval cost).
+    Quantization accuracy note: bnb_4bit mode verified safe from source —
+    trials search on nf4-dequantized-to-fp32 weights; final merge RELOADS
+    bf16 from disk on CPU, so output is always original-precision + delta.
+    We run quantization=none (both 3090s available) so the question is moot.
+    QUANT PLAN (llm-compressor, the vllm-project-maintained path):
+    a. MTP survival check on heretic's export (heretic touches only
+       attn.o_proj/mlp.down_proj; re-attach pristine mtp.* from the
+       untouched download if the re-shard drops them).
+    b. Body: llm-compressor oneshot with AutoRound modifier, W4A16 g128
+       symmetric compressed-tensors — same algorithm family as the
+       Leminkozey recipe (Intel AutoRound standalone), implemented and
+       CI-tested inside vllm-project; official Qwen3.8-27B 4-bit key-model
+       example is the reference. Keep vision tower + in_proj bf16 per
+       recipe. (NVFP4/MXFP4 rejected: Blackwell formats, no sm86 tensor
+       cores, measured W4A16-parity on 3090.)
+    c. Heads: repo prepare/ requant after the body pass — quant_lm_head.py
+       (BITS=8 GPTQ-recalibrated), quant_embed.py (int8), quant_heads_stream
+       (HEAD_BITS=8, MTP_BITS=8) with the repo 40,960-id draft vocab list;
+       rebuild the draft-vocab list from Qwopus-Coder's own token
+       distribution if MTP acceptance reads depressed (#139 Swift precedent:
+       25.9k distinct ids, 99.8% coverage, deficit gone).
+    d. Validate: boot CTX=long + SPEC=mtp, #404 garble check, quality
+       battery (PPL+GSM8K vs repo numbers), seeded conc_ladder A/B vs
+       Leminkozey baseline (83.0 tok/s, 2.77 tok/step, protocol of
+       2026-10-31/11-01). Honest comparison: both models through the same
+       quant pipeline.
+    NOTE: while this run is live, both vLLM lanes are DOWN (approved).
+    Restore = qwen38-super-pthfa-on gpu0 + gpu2 after export.
+ - 0.32-rebase candidates recorded 2026-10-16 (#59973 quantized draft lm_head,
   #46963 NVFP4 paged KV, #57881 Mamba ops out of CUDA graphs, #61422/#59735
   free riders): several landed with the 0.32 series; re-diff the remaining
   ones against the served image before scheduling any.
