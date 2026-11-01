@@ -312,6 +312,50 @@ profile.
   unmet acceptance criterion (only parity observed, default-off); experimental.
 - #423 ready-made Cyrillic draft vocab: RU-heavy traffic only; full head
   measured ~2% slower on English. Adopt only if RU workload appears.
+
+### 2026-11-01 club-3090 scan (noonghunna/club-3090, master d7b35c5)
+
+Scanned for methods/techniques beyond HyperQwen that would improve accuracy,
+KV cache, or performance for our twin-3090 single-user profile. Repo: 0 open
+PRs, ~30 open issues (mostly bench reports), engines: vLLM, SGLang,
+llama.cpp, QEngine, Strata, PrismML.
+
+20. [x] club-3090 scan findings. (All claims from club-3090 BENCHMARKS.md
+    and issues as of 2026-11-01.)
+    - QEngine 1.3.3.1 (`ghcr.io/bpx03/qengine`, PolyForm Noncommercial
+      license): custom engine with a FINE-TUNED MTP head for Qwen3.8-27B
+      (RedHat INT4 weights). Measured at TP=2: 147-157 narr tok/s decode
+      (accept 3.28-3.41, TTFT 36-39 ms), 8-pack quality 108-123/150
+      thinking-off, 132-137/150 thinking-on; promoted to
+      Production-w/-caveats (#1892). The only >20%-decode item found
+      anywhere in this scan. NOT a drop-in for us: different engine
+      (llama.cpp-style /props API, no vLLM patch series, no router), different
+      checkpoint, NC license (personal use fine). If Chris ever wants a
+      second "fast lane", this is the candidate; it does not replace the
+      PTH_FA vLLM lanes.
+    - MAMBA_BLOCK_SIZE=8192 pool-recovery knob (club-3090 #1170): worth ~20%
+      pool on their BATCH MTP arm (MAX_SEQS 4-32, align every 1,616 tokens).
+      CHECKED OUR CONFIG: single-user MAX_SEQS=1; engine pads mamba pages by
+      0.09% (boot log). Gain here ~= zero. vllm 0.32 carries
+      cache_config.mamba_block_size if we ever batch. Not porting.
+    - GPU-unlock A/B (#1755): prefill +14.5-18.4%, decode flat. Matches our
+      earlier verification (unlock active here; benefits already banked).
+    - BF16-unlock W4A16-vs-W4A8 re-measure (issue #1798): W4A8's prefill
+      advantage narrowed +46/+37% -> +25-27%/+18-19% post-unlock; W4A16
+      decode slightly ahead. Our W4A16 weights + INT8_ACT prefill capture
+      exactly this post-unlock optimum. Confirms, changes nothing.
+    - Strata 0.2.9 + Qwen3.8-Flash-Next (MoE sibling via CPU expert offload):
+      125/159-165 tok/s at 524K context with YaRN x2, int8 KV, own MTP layer
+      (#1888 same-release rematch). Different model family (Flash-Next MoE),
+      needs ~77+ GB host RAM for the expert arena, IQ3_S weights. Not
+      applicable to our dense-27B lanes; noted as the deep-context MoE path
+      if that model family ever interests Chris.
+    - Methodology note adopted for all future fleet benches: bench on a
+      dedicated boot — club-3090 measured a gate-chained bench reading
+      -25-27% (allocator/cudagraph state) on identical config.
+    VERDICT: nothing to port to the PTH_FA vLLM lanes. The fleet remains at
+    the measured optimum for this profile. QEngine recorded as the one real
+    alternative engine; mamba-block-size ruled out with numbers.
 - 0.32-rebase candidates recorded 2026-10-16 (#59973 quantized draft lm_head,
   #46963 NVFP4 paged KV, #57881 Mamba ops out of CUDA graphs, #61422/#59735
   free riders): several landed with the 0.32 series; re-diff the remaining
