@@ -577,6 +577,68 @@ for a future multi-stream deep-context tier; NOT adoptable as-is.
     ComfyUI would have to move). Complementary repo: sparsekv-lab (same
     author; research notes behind the release).
 
+### 2026-11-02 sparsekv PORT + WINDOW SESSION (executed; measured; decision pending)
+
+Trigger (a) fired and Chris approved the port. Execution record:
+`sparsekv-port/` (PLAN, ledger, WINDOW-RUNBOOK, patches/, NOTES) and
+`bench-results/sparsekv-gpu2-20261102/RESULTS.md` @ fc7220f.
+
+FIT BLOCKERS 1 (0.31 base) and 4 (basis provenance) are RESOLVED:
+- Port rebased onto 0.32 + the 65-patch black-monolith series
+  (UPSTREAM_PIN d2d876d); patched tree proven INERT without knobs (pthfa
+  gate PASS, sparse_kv.enabled()=False) — the property that makes rollback
+  trivial.
+- Basis refit on qwopus-heretic keys: basis27-qwopus.pt, held-out
+  key-energy 0.87 native / ~0.55 at +64K/+128K RoPE shift.
+
+MEASURED 2026-11-02 (sparse decode LIVE on GPU2, :18025, MAX_LEN=131072
+MAX_SEQS=2, 16/16 sketch caches int4 @ BS=864, `switch -> SPARSE` logged):
+- 115,185-token needle @ 72% depth, thinking ON, MTP k3 ON: EXACT
+  retrieval, finish=stop, 116 s including the cold prefill.
+- 2-stream cached follow-ups: both correct, 4.4 s wall TOTAL; 114,048 of
+  115,176 prompt tokens prefix-cached (sparse-suffix path — the repo's
+  core mechanic, working on our rig).
+- Thinking-on code generation through sparse decode: clean stop, no
+  unterminated <think>. MTP acceptance counters moving under sparse.
+- GPU0 untouched throughout (verified). Production :18021 restored and
+  healthy at window close (~140 s boot).
+
+BLOCKER (why the 8x250K headline does NOT port): request ADMISSION still
+requires the whole sequence to fit the ~135K-token GPU pool. Upstream's
+tier_admission.py — the beyond-pool piece — is an UNWIRED SKELETON in the
+release ("Freeing the GPU blocks (actual capacity) is the admission work
+described in STREAM_tier.md"). 192K/262K prompts sit at waiting=capacity
+forever; their own RELEASE.md shows the same Running-1/Waiting-1 shape
+(their concurrency = cached follow-ups + pipelining, which we reproduced).
+
+BOOT-CHAIN FIXES (all in-container; scripts in sparsekv-port/patches/):
+variant image CMD must be `single` (commit artifact); start_qwen.sh
+PTH_FA+kv-transfer-config refusal bypassed; the ALLOC_DEFAULT
+expandable_segments:False arm must keep its real pattern (vLLM refuses
+connectors under VMM); `--block-size 864` REQUIRED (sparse kernels reject
+the 816 default); `SPARSE_KV=1 SPARSE_IMPL=triton` are mandatory master
+switches. One-command boot: `~/bin/qwen38-sparse-gpu2-on`.
+
+NEXT STEPS (three branches; decision = Chris, nothing automatic):
+21a. [ ] ADOPT-AT-128K (cheap, ~4-6 h in one window): bake the in-container
+     patches into a rebuilt variant image (one docker commit) so boots need
+     no manual patching; run the deferred gate at 128K (KLD matrix MTP-on +
+     thinking-on arm, conc ladder, 2 h two-stream soak, WINDOW-RUNBOOK
+     sections 3-7); if gates pass, register sparse as a tray/router option
+     on :18025. Unlocks TODAY: 2 concurrent ~120K agents per card (vs the
+     current 1 x 200K dense) at ~95.6%-class expected fidelity.
+21b. [ ] FULL 2x262K (the plan's original goal; multi-day): implement
+     tier_admission per upstream STREAM_tier.md stream-E design
+     (HostTierFullAttentionSpec with per-request GPU need capped at
+     sinks+tail+hot; host block pool + block_table_updates rewrite;
+     staged scratch for prefill over spilled blocks) against 0.32
+     v1/core/sched internals. Standing upgrade tax applies. Then the full
+     WINDOW-RUNBOOK battery. The only path to the 262K x 2 headline.
+21c. [ ] PARK: port work stays inert (variant image + untracked upstream);
+     re-engagement triggers in the review block above unchanged.
+- Candidate extra: report the admission gap upstream (bradj00 repo issue) —
+  external action, needs Chris's OK first.
+
 ## Conventions
 
 - `black-monolith` is THE deployment branch: all custom work (router, launchers,
