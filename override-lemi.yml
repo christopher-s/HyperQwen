@@ -1,0 +1,9 @@
+services:
+  solo:
+    env_file:
+      - path: .env.lemi-test
+        required: true
+  prepare:
+    env_file:
+      - path: .env.lemi-test
+        required: true
