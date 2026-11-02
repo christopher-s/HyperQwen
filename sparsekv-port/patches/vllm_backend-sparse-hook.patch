@@ -1,0 +1,143 @@
+diff --git a/pthfa/python/pth_flash_attn/vllm_backend.py b/pthfa/python/pth_flash_attn/vllm_backend.py
+index 0b29ca4..542cc42 100644
+--- a/pthfa/python/pth_flash_attn/vllm_backend.py
++++ b/pthfa/python/pth_flash_attn/vllm_backend.py
+@@ -44,6 +44,7 @@ adaptive verification (device ``q_len`` smaller than the host bound) works.
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ import inspect
+ from dataclasses import dataclass
+ from typing import Any, ClassVar
+@@ -77,6 +78,7 @@ from vllm.v1.worker.workspace import (
+ )
+ 
+ from pth_flash_attn import ops
++from pth_flash_attn import sparse_kv
+ from pth_flash_attn.planner import (
+     MAX_ROWS_PER_CTA,
+     SUPPORTED_HEAD_SIZES,
+@@ -190,6 +192,9 @@ class PthAttnMetadata:
+     prefill: PthLaunchSlice | None
+     use_cascade: bool = False
+     common_prefix_len: int = 0
++    # SPARSE_KV=1: run the decode slice sparse this step (host decision from
++    # max_seq_len and the per-GPU cutoff table; see sparse_kv.decide).
++    sparse_decode: bool = True
+ 
+ 
+ def _group_size(num_heads_q: int, num_kv_heads: int) -> int:
+@@ -288,6 +293,13 @@ class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
+         # query_start_loc of the prefill slice, rebased to 0 on the device. One
+         # int32 per request plus one: persistent so the step allocates nothing,
+         # and not in the KV budget because it is a few bytes.
++        # Every build publishes the per-step dense/sparse decision that picks
++        # the decode graph family. MTP drafter layers can share this group; a
++        # drafter build comes after the target replay of the same step and the
++        # next target build overwrites the decision, so that is harmless.
++        self._sparse_target = sparse_kv.enabled()
++        logger.info("pth_flash_attn: builder for %d layers (%s ... %s)", len(layer_names),
++                    layer_names[0] if layer_names else "-", layer_names[-1] if layer_names else "-")
+         self._prefill_qsl = torch.zeros(
+             int(vllm_config.scheduler_config.max_num_seqs) + 1,
+             dtype=torch.int32,
+@@ -432,7 +444,14 @@ class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
+                 max_query_len=int(cam.max_query_len),
+                 is_prefill=True,
+             )
++        sparse_decode = True
++        if self._sparse_target:
++            ub = cam.seq_lens_cpu_upper_bound
++            # Real (unpadded) request count: padded FULL-graph rows have length 0.
++            n_real = int((ub.numpy() > 0).sum()) if ub is not None else num_reqs
++            sparse_decode = sparse_kv.decide(int(cam.max_seq_len), n_real)
+         return PthAttnMetadata(
++            sparse_decode=sparse_decode,
+             num_actual_tokens=num_tokens,
+             max_query_len=int(cam.max_query_len),
+             query_start_loc=cam.query_start_loc,
+@@ -640,7 +659,17 @@ class PthFlashAttnImpl(TritonAttentionImpl):
+         self._cache_views: tuple[int, tuple[torch.Tensor, ...]] | None = None
+         self._ws_token_splits = 0
+         self._no_workspace: torch.Tensor | None = None
+-        self._reserve_workspace(get_current_vllm_config_or_none())
++        vllm_config = get_current_vllm_config_or_none()
++        self._reserve_workspace(vllm_config)
++        if sparse_kv.enabled() and vllm_config is not None:
++            # G-1: budget sketch/staging/tier buffers (allocated after profiling) out of the KV pool
++            sparse_kv.install_memory_reserve()
++        # SPARSE_KV=1: per-layer sparse state, created at the first forward
++        # (the layer name is known there); False = dense layer.
++        self._sparse: sparse_kv.LayerSparse | bool | None = None
++        self._sparse_max_seqs = (
++            int(vllm_config.scheduler_config.max_num_seqs) if vllm_config else 1
++        )
+ 
+     def _reserve_workspace(self, vllm_config: VllmConfig | None) -> None:
+         """Reserve W_ts token-splits of fp32 partials in the shared workspace.
+@@ -785,12 +814,58 @@ class PthFlashAttnImpl(TritonAttentionImpl):
+             # Memory-profile run: no attention is executed.
+             return output.fill_(0)
+         caches = self._caches(kv_cache)
++        sp = self._sparse
++        if sp is None:
++            sp = False
++            if sparse_kv.enabled():
++                name = getattr(layer, "layer_name", "") or ""
++                st = sparse_kv.LayerSparse(name, self._sparse_max_seqs)
++                sp = st if st.active else False
++            self._sparse = sp
++        if sp:
++            sp.ensure(kv_cache)
++            if key is not None:
++                sp.write(key, attn_metadata.slot_mapping)
++        tier = sparse_kv._tier_runtime() if sparse_kv.enabled() else None
++        lname = getattr(layer, "layer_name", "") or ""
+         if attn_metadata.decode is not None:
+-            self._run_slice(
+-                attn_metadata.decode, query, output, caches, attn_metadata.causal
+-            )
++            part = attn_metadata.decode
++            if tier is not None and not sp:
++                part = tier.window_part(lname, part, 0)
++            # Dense/sparse switch: decided on the host per step (or fixed by the
++            # graph family being captured). Static shortcut: if the block table
++            # cannot hold more than C tokens, every request is selected whole.
++            if (
++                sp
++                and sparse_kv.decode_sparse(attn_metadata)
++                and part.block_table.shape[1] * kv_cache.shape[2] > sparse_kv.cfg().C
++            ):
++                st_kv, st_bt, n_valid = sp.select_and_stage(
++                    part, query, kv_cache, self.scale
++                )
++                part = dataclasses.replace(part, seq_lens=n_valid, block_table=st_bt)
++                self._run_slice(
++                    part, query, output, sparse_kv.staging_views(self, st_kv),
++                    attn_metadata.causal,
++                )
++            else:
++                self._run_slice(part, query, output, caches, attn_metadata.causal)
+         if attn_metadata.prefill is not None:
+-            self._run_slice(
+-                attn_metadata.prefill, query, output, caches, attn_metadata.causal
+-            )
++            part = attn_metadata.prefill
++            pcaches = caches
++            if tier is not None:
++                r0 = attn_metadata.decode.seq_lens.shape[0] if attn_metadata.decode is not None else 0
++                # S4: per-request prefill (follow-up suffixes sparse over sketch + host rows, long chunks staged
++                # in one batched copy without a host sync); False -> legacy staging below.
++                if sp and tier.prefill_layer(self, lname, sp, kv_cache, part, r0, query, output, caches,
++                                             attn_metadata.causal, sparse_kv.staging_views):
++                    return output
++                if sp:
++                    staged = tier.stage_prefill(lname, kv_cache, part, r0)
++                    if staged is not None:
++                        pf_kv, part = staged
++                        pcaches = sparse_kv.staging_views(self, pf_kv, attr="_tier_pf_views")
++                else:
++                    part = tier.window_part(lname, part, r0)
++            self._run_slice(part, query, output, pcaches, attn_metadata.causal)
+         return output
