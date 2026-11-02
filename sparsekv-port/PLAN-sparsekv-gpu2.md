@@ -16,7 +16,7 @@
 - **GPU2 stays in production until Task 7.** The current dense engine (`:18021`, MAX_SEQS=1, MAX_LEN=200000) serves traffic. The sparse engine boots on **:18025** for all validation. Nothing on :18021 stops until the A/B gate passes and Chris approves the swap.
 - **Scope: 2 streams only.** `MAX_SEQS=2`, `MAX_LEN=262144`, GPU_UTIL 0.94. No 4-stream configs, no GPU0 replication, no tray integration in this plan (tray integration is a follow-up after Chris adopts it).
 - **MTP stays on.** Production parity requires SPEC=mtp k3. Their KLD numbers ran MTP-off; Task 6 re-measures with MTP on, which is the number that matters for our serving state.
-- **Host RAM budget: ≤ 20 GB pinned.** 2 × 262,144 tokens × ~17.8 KB/token ≈ 9.3 GB tier + working slack. `SPARSE_TIER_HOST_GB=12` is the working value (headroom without starving ComfyUI's 16 GB resident). Boot must fail loudly if pinned allocation would push `MemAvailable` below 8 GB.
+- **Host RAM budget: ≤ 20 GB pinned, host tier at int8.** 2 × 262,144 tokens × 33,280 B/token (520 B/token-head × 4 heads × 16 FA layers, int8 with inline scales) ≈ 17.4 GB tier + slack. `SPARSE_TIER_HOST_GB=18` is the working value (Chris directive 2026-11-02: the KV cache must NOT go to 4-bit — use what we have; the GPU-side pthfa int8 cache is unchanged by design and the host mirror runs at its default 8-bit, per tier.py `SPARSE_TIER_HOST_BITS=8`). Boot must fail loudly if pinned allocation would push `MemAvailable` below 8 GB.
 - **Every measurement lands in** `~/tools/hyperqwen/bench-results/sparsekv-gpu2-<date>/`.
 - Model under test: `/mnt/500gb-ssd/ai/models/qwopus-heretic-W4A16-AutoRound` (same weights as production; the plan does not change weights).
 
@@ -158,7 +158,7 @@ cd ~/tools/hyperqwen && git add sparsekv-port/ && git commit -m "sparsekv port: 
 
 **Interfaces:**
 - Consumes: Task 3's installed venv + basis.
-- Produces: a running sparse engine on :18025 with `SPARSE_PROFILE=tier MAX_LEN=262144 MAX_SEQS=2 GPU_UTIL=0.94 SPARSE_TIER_HOT_FRAC=0.025 SPARSE_SKETCH_BITS=4 SPARSE_TIER_HOST_BITS=4 SPARSE_TIER_HOST_GB=12 SPARSE_STATS_SUB=4 SPARSE_SELECT_EVERY=2 SPARSE_MEM_RESERVE=1 SPARSE_TIER_SPILL=1`, serving model id `qwen3.8-27b`.
+- Produces: a running sparse engine on :18025 with `SPARSE_PROFILE=tier MAX_LEN=262144 MAX_SEQS=2 GPU_UTIL=0.94 SPARSE_TIER_HOT_FRAC=0.025 SPARSE_SKETCH_BITS=4 SPARSE_TIER_HOST_BITS=8 SPARSE_TIER_HOST_GB=18 SPARSE_STATS_SUB=4 SPARSE_SELECT_EVERY=2 SPARSE_MEM_RESERVE=1 SPARSE_TIER_SPILL=1`, serving model id `qwen3.8-27b`. (HOST_BITS=8 per Chris 2026-11-02: KV stays at our int8 precision everywhere; the int4 sketch is a separate scoring index, KV data never drops to 4-bit.)
 
 - [ ] **Step 1: Write the boot wrapper**
 
