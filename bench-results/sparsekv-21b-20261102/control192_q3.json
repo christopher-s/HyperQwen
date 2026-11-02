@@ -1,0 +1,9 @@
+{
+ "q": "What is the vault combination? One line only.",
+ "wall_s": 2.3,
+ "ttft_est": null,
+ "prompt_tokens": 190965,
+ "cached_tokens": 190080,
+ "finish": "stop",
+ "content_head": "\n\n8314-772-906"
+}

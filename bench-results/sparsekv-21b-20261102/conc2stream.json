@@ -1,0 +1,19 @@
+{
+ "B": {
+  "wall_s": 150.6,
+  "prompt_tokens": 96879,
+  "finish": "stop",
+  "needle_comb": true,
+  "needle_cust": true,
+  "content_head": "\n\nBased on the document, the vault combination is **5560-114-782** and the custodian is **TORSTEN**."
+ },
+ "A": {
+  "wall_s": 177.2,
+  "prompt_tokens": 94162,
+  "finish": "stop",
+  "needle_comb": true,
+  "needle_cust": true,
+  "content_head": "\n\nThe vault combination is **4471-908-263** and the custodian is **DELPHINE**."
+ },
+ "_total_wall_s": 177.2
+}

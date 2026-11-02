@@ -1,0 +1,9 @@
+{
+ "q": "What is the vault combination and who is the custodian? Answ",
+ "wall_s": 240.2,
+ "ttft_est": null,
+ "prompt_tokens": 190973,
+ "cached_tokens": 0,
+ "finish": "stop",
+ "content_head": "\n\nThe vault combination is **8314-772-906** and the custodian is **MARGARET**."
+}
