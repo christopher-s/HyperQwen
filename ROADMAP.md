@@ -226,6 +226,16 @@ router/Bifrost/image state until replacements pass their acceptance gate.
     (Already gone — directory does not exist on disk as of 2026-10-31; only
     doc mentions remain in docs/reproductions and single-user/README, which
     are historical records, not live references.)
+18. [ ] IFEval (lm-eval) on qwopus-heretic with the Qwopus card protocol —
+    PAUSED 2026-11-02 per Chris (2-4 h GPU2 estimate at MAX_SEQS=1 too long
+    for the moment). FULL resume config + gotchas live in the skills repo:
+    winston-skills `local-ai/control/local-ai-operations/references/
+    qwopus-heretic-eval-roadmap.md` (canonical status board — consult that
+    first). Short form: xhigh template, card sampling (temp 1.0, top_p
+    0.95, top_k 20), max_gen_toks=8192 (IFEval default 1280 starves under
+    xhigh reasoning), verbatim /v1/chat/completions base_url,
+    tokenized_requests=false, seed 1234, output
+    bench-results/qwopus-lmeval-<date>-xhigh/.
 
 ## Watch list (upstream, no action yet)
 
@@ -512,6 +522,60 @@ llama.cpp, QEngine, Strata, PrismML.
   #46963 NVFP4 paged KV, #57881 Mamba ops out of CUDA graphs, #61422/#59735
   free riders): several landed with the 0.32 series; re-diff the remaining
   ones against the served image before scheduling any.
+
+### 2026-11-02 third-party scan: bradj00/sparsekv-hyperqwen (reviewed, not adopted)
+
+Query-aware sparse KV decode + int4 pinned-host-RAM KV tier for HyperQwen
+vLLM 0.31 + pthfa. Headline: 8 concurrent 250K agents on a 3090 Ti + 3090
+(Qwen3.8-27B W4A16, MTP-7). Reviewed 2026-11-02 against our rig (README +
+eval/kld methodology + their rig specs). Status: WATCH-LIST DESIGN REFERENCE
+for a future multi-stream deep-context tier; NOT adoptable as-is.
+
+21. [x] sparsekv review recorded. Key facts (all from the repo):
+    - Mechanism: 16 of 64 layers are full attention (48 GDN linear).
+      Per decode step, a frozen rank-64 int4 key sketch (basis27.pt =
+      eigenvectors of real post-RoPE keys, prefix-cache compatible) scores
+      all tokens; exact pthfa int8 attention runs on top-2048 + 64 sinks +
+      last 1024. Full KV lives in pinned host RAM at int4 (4.4 GB/250K
+      agent); GPU keeps sketch + sinks + tail + 2.5% CLOCK hot buffer;
+      UVA zero-copy host reads ~10 GB/s (x16) / 6.2 GB/s (x4), 14-16% miss.
+    - Quality (teacher-forced KLD vs dense, same card, 60 samples, temp 0,
+      MTP OFF): sparse GPU-only 0.0188 KLD / 96.4% top-1 — BETTER than the
+      dense-cross-card noise floor (0.0200 / 96.2%), a well-designed
+      control. Production int4 tier 0.0269 / 95.6%; recall tasks 99.6%
+      top-1; divergence grows 0.024@32K -> 0.033@192K; prose 2x code.
+    - Their own honest notes: missed their 300 tok/s/card target
+      (268-285); greedy free-running output drifts after first divergent
+      token; tier hooks "monkeypatch vLLM scheduler internals and are
+      fragile across vLLM upgrades"; no 5th agent/card at MTP-7.
+    FIT BLOCKERS for us (each verified against our rig 2026-11-02):
+    1. vLLM base: they built on 0.31 @ ce9615c; we run 0.32.0 + the
+       65-patch black-monolith series. Their fragility warning applies to
+       exactly this jump; port = rebase their scheduler patches + pthfa
+       sparse hook onto our series, with a standing upgrade tax.
+    2. Host RAM: they have 96 GB (78 GB in VM); we have 45 GB total,
+       ~7 GB free (ComfyUI resident 16.2 GB). Their single-server config
+       reserves 17.8 GB pinned; the 8x250K headline needs ~35 GB. Their
+       configs do not fit this box.
+    3. MTP: all their quality numbers ran MTP OFF (custom logits
+       processors rejected under spec decode). Our production runs MTP k3;
+       the fidelity numbers do not transfer to our serving state.
+    4. Basis provenance: basis27.pt is fitted on STOCK Qwen3.8-27B keys;
+       qwopus-heretic is a fine-tune with shifted key distributions ->
+       refit required (their fit_basis27.py is included) + revalidation.
+    THE INTERESTING ANGLE: it attacks exactly our tier's constraint
+    (MAX_SEQS=1 = one 200K stream per card). Demonstrates 2-4 concurrent
+    200K+ streams per 24 GB card at ~95.6% top-1 fidelity; single-user
+    A/B at ~113K showed +15-36% decode vs dense on the SAME card. Our x4
+    (GPU0) / x16 (GPU2) link split matches their rig's, reversed.
+    RE-ENGAGEMENT TRIGGERS (any one): (a) Chris wants concurrent 200K+
+    Hermes agents on one card (the only feature we currently lack);
+    (b) a 0.32+ rebase of the sparse patches appears (theirs or fork);
+    (c) host RAM upgrade to 96+ GB. PORT CHECKLIST if triggered: rebase 3
+    patches + pthfa hook onto our series -> refit basis on qwopus-heretic
+    keys -> KLD-validate WITH MTP k3 ON -> RAM budget (needs ~20 GB free;
+    ComfyUI would have to move). Complementary repo: sparsekv-lab (same
+    author; research notes behind the release).
 
 ## Conventions
 
