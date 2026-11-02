@@ -625,8 +625,13 @@ NEXT STEPS (three branches; decision = Chris, nothing automatic):
      no manual patching; run the deferred gate at 128K (KLD matrix MTP-on +
      thinking-on arm, conc ladder, 2 h two-stream soak, WINDOW-RUNBOOK
      sections 3-7); if gates pass, register sparse as a tray/router option
-     on :18025. Unlocks TODAY: 2 concurrent ~120K agents per card (vs the
-     current 1 x 200K dense) at ~95.6%-class expected fidelity.
+     on :18025. Unlocks: faster per-stream long-context decode (their
+     same-card A/B +15-36% at ~113K; ours UNMEASURED — add a sparse-vs-dense
+     decode A/B to the gate). FRAMING FIX (2026-11-02, Chris challenge):
+     the released tier adds NO capacity — GPU blocks stay allocated, so
+     2 x ~105K independent streams are reachable on DENSE too via the
+     native 0.32 flag --no-scheduler-reserve-full-isl + MAX_SEQS=2.
+     21a's real value = decode speed + the baked foundation for 21b.
 21b. [ ] FULL 2x262K (the plan's original goal; multi-day): implement
      tier_admission per upstream STREAM_tier.md stream-E design
      (HostTierFullAttentionSpec with per-request GPU need capped at
