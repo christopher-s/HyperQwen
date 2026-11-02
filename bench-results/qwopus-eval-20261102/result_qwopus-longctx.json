@@ -1,0 +1,28 @@
+{
+ "tag": "qwopus-longctx",
+ "ts": "2026-11-02 09:35:10",
+ "longctx": {
+  "score": 1.0,
+  "rows": [
+   {
+    "task": "needle-alpha",
+    "expected": "ZEPHYR-88",
+    "found": true
+   },
+   {
+    "task": "needle-num",
+    "expected": "77431-Q",
+    "found": true
+   },
+   {
+    "task": "needle-name",
+    "expected": "Marta Kowalczyk",
+    "found": true
+   },
+   {
+    "task": "reply_chars",
+    "value": 42
+   }
+  ]
+ }
+}

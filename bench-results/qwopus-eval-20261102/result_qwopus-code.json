@@ -1,0 +1,84 @@
+{
+ "tag": "qwopus-code",
+ "ts": "2026-11-02 09:34:14",
+ "code": {
+  "score": 0.875,
+  "rows": [
+   {
+    "task": "merge-intervals",
+    "pass": true,
+    "note": "ok"
+   },
+   {
+    "task": "case-search",
+    "pass": true,
+    "note": "ok"
+   },
+   {
+    "task": "drop-remainder",
+    "pass": true,
+    "note": "ok"
+   },
+   {
+    "task": "lru-cache",
+    "pass": true,
+    "note": "ok"
+   },
+   {
+    "task": "csv-parse",
+    "pass": false,
+    "note": "assertion failed"
+   },
+   {
+    "task": "flatten",
+    "pass": true,
+    "note": "ok"
+   },
+   {
+    "task": "word-freq",
+    "pass": true,
+    "note": "ok"
+   },
+   {
+    "task": "binary-search",
+    "pass": true,
+    "note": "ok"
+   }
+  ]
+ },
+ "instruction": {
+  "score": 0.5,
+  "rows": [
+   {
+    "task": "json-only",
+    "pass": true,
+    "reply": "{\"a\":3,\"b\":\"x\"}"
+   },
+   {
+    "task": "haiku-575",
+    "pass": false,
+    "reply": "Silicon hums\nParallel threads weave light\nCompute the world"
+   },
+   {
+    "task": "count-words",
+    "pass": false,
+    "reply": "The quick brown fox jumps over the lazy dog"
+   },
+   {
+    "task": "no-letter",
+    "pass": true,
+    "reply": "Cat, dog, fox"
+   },
+   {
+    "task": "reverse",
+    "pass": false,
+    "reply": "lativeve"
+   },
+   {
+    "task": "sort-numbers",
+    "pass": true,
+    "reply": "-5, 3, 3, 9, 17, 42"
+   }
+  ]
+ }
+}
