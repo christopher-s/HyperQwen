@@ -1,0 +1,8 @@
+{
+ "wall_s": 244.7,
+ "prompt_tokens": 190973,
+ "completion_tokens": 177,
+ "finish": "stop",
+ "needle_retrieved": true,
+ "content_head": "\n\nBased on the document, the vault combination is **8314-772-906** and the custodian is **MARGARET**."
+}
