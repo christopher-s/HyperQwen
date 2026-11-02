@@ -632,13 +632,17 @@ NEXT STEPS (three branches; decision = Chris, nothing automatic):
      2 x ~105K independent streams are reachable on DENSE too via the
      native 0.32 flag --no-scheduler-reserve-full-isl + MAX_SEQS=2.
      21a's real value = decode speed + the baked foundation for 21b.
-21b. [ ] FULL 2x262K (the plan's original goal; multi-day): implement
+21b. [ ] FULL 2x262K (Chris APPROVED 2026-11-02): implement
      tier_admission per upstream STREAM_tier.md stream-E design
      (HostTierFullAttentionSpec with per-request GPU need capped at
      sinks+tail+hot; host block pool + block_table_updates rewrite;
      staged scratch for prefill over spilled blocks) against 0.32
      v1/core/sched internals. Standing upgrade tax applies. Then the full
      WINDOW-RUNBOOK battery. The only path to the 262K x 2 headline.
+     PLAN WRITTEN: sparsekv-port/PLAN-21b-admission.md (6 tasks: diagnose
+     the window-session stall -> 192K sizing -> 192K control -> spec wiring
+     -> gate battery -> bake+present; RAM ceiling 2 x ~165K without
+     moving ComfyUI, 2 x 262K needs its 16 GB).
 21c. [ ] PARK: port work stays inert (variant image + untracked upstream);
      re-engagement triggers in the review block above unchanged.
 - Candidate extra: report the admission gap upstream (bradj00 repo issue) —
