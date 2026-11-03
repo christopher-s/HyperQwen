@@ -235,12 +235,10 @@ router/Bifrost/image state until replacements pass their acceptance gate.
        Measured on our exact card: C1 decode +2.1%, chunked-prefill TTFT
        −20–25% at 1k–16k (#430), C4–C8 decode +16–35% (#427/#428).
        Highest practical value of the four — our production prefill is
-       chunked 2048-token, so the TTFT class hits both cards. Caveats:
-       out-of-tree module loaded before the NVIDIA driver at boot, host
-       OS change, upstream ships/tests neither, effects on every GPU
-       workload on the host (both engines, any FP16/FMA math). Verify
-       stability + GSM8K parity on a non-production window first if we
-       ever try it.
+       chunked 2048-token, so the TTFT class hits both cards. ALREADY
+       IN USE HERE: Chris confirmed 2026-11-03; verified live — lsmod
+       shows `gpu_unlock` loaded on black-monolith. So our production
+       numbers already include this module's benefit; nothing to do.
 
 12. [x] Loop-defense injection.
     (DONE 2026-10-31 via the router: every forwarded request that does not
