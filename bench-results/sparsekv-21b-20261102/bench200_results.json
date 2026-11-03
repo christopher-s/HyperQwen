@@ -1,0 +1,43 @@
+{
+ "B": {
+  "cold": {
+   "wall_s": 5.3,
+   "prompt_tokens": 199128,
+   "completion_tokens": 135,
+   "finish": "stop",
+   "pass": true
+  },
+  "warm": {
+   "wall_s": 4.5,
+   "cached": 197856,
+   "pass": true
+  },
+  "decode": {
+   "wall_s": 8.8,
+   "completion_tokens": 320,
+   "tok_s": 36.2,
+   "cached": 197856
+  }
+ },
+ "A": {
+  "cold": {
+   "wall_s": 5.6,
+   "prompt_tokens": 199127,
+   "completion_tokens": 139,
+   "finish": "stop",
+   "pass": true
+  },
+  "warm": {
+   "wall_s": 4.3,
+   "cached": 197856,
+   "pass": true
+  },
+  "decode": {
+   "wall_s": 9.1,
+   "completion_tokens": 317,
+   "tok_s": 34.7,
+   "cached": 197856
+  }
+ },
+ "_total_wall_s": 19.0
+}

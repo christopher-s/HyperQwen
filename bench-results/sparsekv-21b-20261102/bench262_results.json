@@ -1,0 +1,43 @@
+{
+ "B": {
+  "cold": {
+   "wall_s": 457.2,
+   "prompt_tokens": 248748,
+   "completion_tokens": 179,
+   "finish": "stop",
+   "pass": true
+  },
+  "warm": {
+   "wall_s": 272.9,
+   "cached": 247104,
+   "pass": true
+  },
+  "decode": {
+   "wall_s": 10.8,
+   "completion_tokens": 262,
+   "tok_s": 24.3,
+   "cached": 247104
+  }
+ },
+ "A": {
+  "cold": {
+   "wall_s": 730.2,
+   "prompt_tokens": 248749,
+   "completion_tokens": 130,
+   "finish": "stop",
+   "pass": true
+  },
+  "warm": {
+   "wall_s": 5.7,
+   "cached": 247104,
+   "pass": true
+  },
+  "decode": {
+   "wall_s": 7.2,
+   "completion_tokens": 320,
+   "tok_s": 44.3,
+   "cached": 247104
+  }
+ },
+ "_total_wall_s": 743.2
+}
