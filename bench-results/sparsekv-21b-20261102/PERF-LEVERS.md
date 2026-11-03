@@ -131,3 +131,48 @@ bandwidth (already pinned-memory optimal). Restoring the canonical engine now.
 - **Host decode-side batching of sketch fetches**: the 24–44 tok/s contended
   decode is bounded by ~6.5 GB/s DMA; batching fetches raises effective BW.
   Code work, riskier.
+
+---
+
+## GPU-only sparse-decode A/B at 200K (Chris's request) — cannot boot; finding
+
+**Question.** Does GPU-only sparse decode (SPARSE_KV=1, no RAM tier, no
+kv-transfer-config) improve the production profile — MAX_LEN=200000,
+MAX_SEQS=1, MTP k3, int8 KV, prefix caching — vs dense at the same profile?
+
+**Result: the configuration does not fit on the 24 GB card.** Five boot
+variants, all OOM during engine init / graph capture, all verified from
+`docker logs` + RestartCount loop evidence:
+
+| # | variant | outcome |
+|---|---|---|
+| 1 | util 0.94, PIECEWISE graphs, MEM_RESERVE on, VISION on | OOM loop |
+| 2 | util 0.90 (−1 GB), same rest | OOM loop |
+| 3 | CUDAGRAPH_MODE=NONE, util 0.90 | OOM loop |
+| 4 | no MEM_RESERVE, util 0.94, PIECEWISE | OOM loop |
+| 5 | VISION=0 (vision tower unloaded), util 0.94 | OOM loop |
+
+Reference point (measured from the running dense gpu0): production dense
+allocates a 216,091-token KV pool at util 0.94 — only ~16K tokens (≈42 MB
+scale-buffers) of slack above the 200K requirement. The sparse-decode machinery
+(sketch registers, selection workspace, and the dual dense/sparse graph set)
+needs more than that remainder, so dense-KV-at-200K + sparse-decode cannot
+co-exist in 24 GB. Upstream's "GPU-only sparse decode" quality row (README
+line 44) came from their lab harness — their own bench.jsonl shows ctx=131072,
+single-request, no MTP — a materially lighter configuration than ours.
+
+**What this proves.** At production depth, the RAM tier is what makes sparse
+decode viable on 24 GB: it shrinks the GPU pool to 122K–150K tokens and rents
+the freed VRAM to the sparse machinery. The with-tier path is the tested,
+working configuration (19/19 gates + 2 × 262K concurrent, all green). The
+GPU-only alternative is not a smaller-scope option at 200K; it is a
+doesn't-boot option at 200K. A GPU-only A/B would require dropping to ~131K
+class contexts (upstream's lab regime) or dropping MTP — both outside the
+production profile Chris specified.
+
+**Decision:** GPU-only arm closed as infeasible-at-profile. Canonical tier
+engine restored (17 GB tier, 2 × 256K proven) with post-restore smoke PASS
+already recorded above (canonical_smoke.json, 190K needle PASS 243.9 s).
+
+STATUS: closed — infeasible at the 200K production profile; tier is mandatory
+at this depth on 24 GB.
