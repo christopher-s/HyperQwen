@@ -189,6 +189,29 @@ router/Bifrost/image state until replacements pass their acceptance gate.
 
 ## P2
 
+12a. [ ] SparseKV tier follow-up research (PAUSED 2026-11-03 ~16:20 per Chris
+    — investigation halted; results banked in
+    `bench-results/sparsekv-21b-20261102/PERF-LEVERS.md`, commit 4426895).
+    Context: 21b gate session proved the tier path end-to-end (19/19 gates,
+    2 × 262K concurrent, 406% GPU-pool overcommit) and A/B'd every knob —
+    all knobs flat-or-worse; canonical config stands (2048 batched tokens,
+    ASYNC_SCHED=0, HOT_FRAC=0.10, HOST_GB=17). GPU-only sparse decode cannot
+    boot at 200K/1stream/MTP on 24 GB (5 variants OOM); at 131K it measured
+    decode +7% / prefill −2.3% / quality parity — parity-to-slightly-positive,
+    n=2 noise level. OPEN items for later:
+    a) Tier pre-staging depth tuning in tier_connector (upstream roadmap
+       item) — attacks the 670-vs-1080 tok/s dual-cold-prefill contention
+       gap; 1–2 session patch, highest expected value.
+    b) Batched sketch fetches on the decode host path — decode is bounded
+       by ~6.5 GB/s pinned DMA; batching raises effective bandwidth. Code
+       work, riskier; measure at 200K+ depths.
+    c) Longer decode A/B at 131K GPU-only (n≥10 per arm) to resolve whether
+       the +7% decode is real or noise before any consideration of a
+       low-context GPU-only serving mode.
+    d) Warm re-read race: second stream's full-prefix re-read swings
+       3.5–315 s across boots (teardown/re-read race, eviction-dependent);
+       characterize and fix if it reproduces in real two-agent use.
+
 12. [x] Loop-defense injection.
     (DONE 2026-10-31 via the router: every forwarded request that does not
     set its own now carries
