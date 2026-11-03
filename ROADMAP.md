@@ -240,6 +240,50 @@ router/Bifrost/image state until replacements pass their acceptance gate.
        shows `gpu_unlock` loaded on black-monolith. So our production
        numbers already include this module's benefit; nothing to do.
 
+12c. [ ] vLLM upstream scan (2026-11-03, we pin 0.32.0; 0.33.0rc3 out
+    2026-11-02; scan filtered for our profile: Qwen3.8-27B hybrid 48 GDN +
+    16 FA, MTP k3, int8 per-token-head KV CUSTOM backend, PIECEWISE graphs,
+    sm_86, TP1 per engine):
+    OPEN BUGS and our exposure, verified against our tree:
+    a) #65264 (OPEN, Nov 3) Mamba-align prefix cache keys a partial-hit
+       state copy at a boundary no chunk wrote when an internal prefill
+       checkpoint is used. OUR EXPOSURE: REAL AND UNTESTED — we run
+       mamba-cache-mode=align + prefix caching + MTP, the buggy code paths
+       exist in our 0.32.0 scheduler (use_internal_checkpoint at
+       scheduler.py:488, cache_blocks keying), and our usage (multi-turn
+       same-doc conversations, sub-block partial hits) matches the trigger:
+       a third request resuming at a stale key gets the WRONG Mamba state
+       (silent wrongness in the 48 GDN layers, attention fine). Our gates
+       never exercise this chain (single-shot docs). ACTION: build the
+       issue's 3-request repro against our boot; if it reproduces, apply
+       the fix shape (keep the boundary stop under internal checkpoints,
+       or skip keying the CoW copy) as a patch. Severity: correctness.
+    b) #64808 Gemma-4 MTP halves prefix-cache hits with retention-interval:
+       we pass --prefix-cache-retention-interval None explicitly, trigger
+       flag off. NOT EXPOSED.
+    c) #65337 GDN metadata device-side assert under adaptive verification:
+       adaptive verification is dspark-only (speculative.py refuses other
+       methods), default False; we run mtp. NOT EXPOSED.
+    d) #65387 TP worker wedge in GDN Triton launch: requires TP>1; all our
+       engines are TP1. NOT EXPOSED.
+    0.33.0 UPGRADE SURFACE (all blocked on re-cutting our patch series):
+    e) Lookahead block hashes for EAGLE/MTP prefix caching become DEFAULT
+       (#61589; #64096 adds the connector opt-in machinery): strictly
+       better cross-turn prefix reuse with MTP; HostTierConnector opts in
+       via supports_lookahead_block_hashes.
+    f) --mamba-cache-mode DEPRECATED to no-effect (#60043): our launcher
+       passes align explicitly; semantics moved upstream. BREAKING for our
+       mamba-align patch pair; re-cut required.
+    g) Qwen3.8-Flash-Next FP8 QSA KV cache on AMPERE (#60602/#60992,
+       sm86 = our cards): potential KV bandwidth/capacity lever; evaluate
+       against our int8 per-token-head backend (may be redundant).
+    h) CPU offload shm-file pool split (#59546, startup 63.6→38.3 s): boot
+       time only, built-in connector; marginal for our custom tier.
+    VERDICT: no upgrade now — 0.33.0 is rc, our HyperQwen 0.32.0 patch
+    series is the moat, and (a) is a correctness item to repro on OUR
+    config first. Revisit the 0.33.x stable bump alongside the sparsekv
+    roadmap work.
+
 12. [x] Loop-defense injection.
     (DONE 2026-10-31 via the router: every forwarded request that does not
     set its own now carries
