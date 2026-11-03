@@ -1,0 +1,19 @@
+{
+ "cold_g1": {
+  "wall_s": 129.4,
+  "prompt_tokens": 125791,
+  "completion_tokens": 193,
+  "pass": true
+ },
+ "warm_g2": {
+  "wall_s": 3.4,
+  "cached": 124416,
+  "pass": true
+ },
+ "decode": {
+  "wall_s": 5.4,
+  "completion_tokens": 248,
+  "tok_s": 45.7,
+  "cached": 124416
+ }
+}

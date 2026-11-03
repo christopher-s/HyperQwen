@@ -176,3 +176,39 @@ already recorded above (canonical_smoke.json, 190K needle PASS 243.9 s).
 
 STATUS: closed — infeasible at the 200K production profile; tier is mandatory
 at this depth on 24 GB.
+
+---
+
+## GPU-only A/B at 131K (Chris's approved fallback) — measured 2026-11-03 ~16:00
+
+Profile for both arms: MAX_LEN=131072, MAX_SEQS=1, MTP k3, VISION on, int8 KV,
+prefix caching, PIECEWISE graphs, util 0.94. Identical 125,791-token document,
+identical prompts, temperature 0. Sparse arm: SPARSE_KV=1, no tier (sparse
+engaged per-step above the 20K cutoff; KV pool 185,227 tokens). Dense arm:
+SPARSE_KV=0 (KV pool 208,773 tokens). One boot per arm, sparse measured twice
+(second boot for decode-sample symmetry; all files bench131_*.json).
+
+| metric (identical profile) | sparse GPU-only | dense | delta |
+|---|---|---|---|
+| cold prefill 125,791 tok | 132.4 s (950 tok/s) | 129.4 s (972 tok/s) | −2.3% |
+| warm re-read (full prefix cached) | 3.5 s | 3.4 s | parity |
+| decode, full-length samples | 52.5 tok/s (n=2) | 49.1 tok/s (n=2) | **+7.0%** |
+| needle accuracy | 2/2 PASS | 2/2 PASS | parity |
+| KV pool footprint | 185,227 tok | 208,773 tok | −11% VRAM |
+
+**Reading.** At 131K on our stack, GPU-only sparse decode trades ~2% prefill
+and 11% KV-pool capacity for ~7% decode throughput — same direction as
+upstream's claims, smaller magnitude (their +15–36% was at ~113K on a different
+serving stack and likely includes non-MTP configs; our MTP k3 dominates decode
+time either way). The +7% decode is within run-to-run noise of n=2 per arm
+(sparse samples 50.6/54.5, dense 49.2/49.0) — treat it as "parity to slightly
+positive," proven-quality-neutral (4/4 needles across arms).
+
+**Why this doesn't change the production recommendation.** The 131K GPU-only
+point cannot serve the 200K profile (previous section: doesn't boot at 200K
+with MTP), and the tier at 200K already delivers the capability GPU-only can't
+(200–262K contexts on 24 GB at all). Where GPU-only wins is exactly where we
+don't need it: short contexts where dense KV fits anyway.
+
+STATUS: A/B complete — GPU-only viable only ≤131K-class on 24 GB; parity-to-
++7% decode there; production stays on the tier config.
