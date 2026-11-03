@@ -212,6 +212,36 @@ router/Bifrost/image state until replacements pass their acceptance gate.
        3.5–315 s across boots (teardown/re-read race, eviction-dependent);
        characterize and fix if it reproduces in real two-agent use.
 
+12b. [ ] Upstream syv-ai/HyperQwen sync review (scanned 2026-11-03, 4 changes
+    since our Oct-30/31 pin, none blocking):
+    a) D-LSA latent sparse attention (LSA=1, main 8da0018b): prefill TTFT
+       −13% at 137k, wins only from ~100k, decode wash, accuracy parity.
+       INCOMPATIBLE with our production (refused with PTH_FA=1 and with a
+       KV offload tier); index tables cost +7% of the KV pool. Overlaps
+       the sparsekv tier's goal with a different mechanism; re-evaluate
+       only if we ever serve 100k+ WITHOUT the tier.
+    b) SWA history retention at Mamba offload boundaries (8e4238fd /
+       #424): fixes vLLM's NATIVE offloading connector joint-lookup at
+       EAGLE block-drop boundaries. We run HostTierConnector (our own),
+       so no direct impact — but review whether our tier boundary logic
+       has the same block-drop boundary class of bug (19/19 gates passed,
+       no observed symptom; fold into roadmap item 12a-a's session).
+    c) Cyrillic draft-vocab variant (27ee55c8, #411): MTP coverage on
+       Russian 17.25% → 99.74%. English ids unchanged and in order, so
+       it is a no-op for our English production; adopt only for future
+       Cyrillic serving.
+    d) gpu-unlock field reports (#427/#428/#430, docs only): third-party
+       host kernel module lifting GeForce's half-rate FP16 tensor cap.
+       Measured on our exact card: C1 decode +2.1%, chunked-prefill TTFT
+       −20–25% at 1k–16k (#430), C4–C8 decode +16–35% (#427/#428).
+       Highest practical value of the four — our production prefill is
+       chunked 2048-token, so the TTFT class hits both cards. Caveats:
+       out-of-tree module loaded before the NVIDIA driver at boot, host
+       OS change, upstream ships/tests neither, effects on every GPU
+       workload on the host (both engines, any FP16/FMA math). Verify
+       stability + GSM8K parity on a non-production window first if we
+       ever try it.
+
 12. [x] Loop-defense injection.
     (DONE 2026-10-31 via the router: every forwarded request that does not
     set its own now carries
